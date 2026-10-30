@@ -42,6 +42,10 @@ on:
         description: 'GitHub App id. Default is the ROUTACT_APP_ID variable.'
         type: string
         required: false
+      runs-on:
+        description: 'Runner for the route job itself, as JSON (a label or a label array). Default is the ROUTACT_ROUTER_RUNS_ON variable, else "ubuntu-slim".'
+        type: string
+        required: false
     secrets:
       ROUTACT_APP_PRIVATE_KEY:
         required: false
@@ -66,9 +70,12 @@ on:
 
 jobs:
   route:
-    # The smallest, fastest-starting GitHub-hosted runner. Never self-hosted:
-    # the router must not depend on the pool it is checking.
-    runs-on: ubuntu-slim
+    # The smallest, fastest-starting GitHub-hosted runner by default. Set the
+    # runs-on input or the ROUTACT_ROUTER_RUNS_ON variable to route from a
+    # runner that does not use GitHub's minutes, such as Blacksmith. Never use
+    # a pool the router checks: it could not route away from that pool when it
+    # is full.
+    runs-on: ${{ fromJSON(inputs.runs-on || vars.ROUTACT_ROUTER_RUNS_ON || '"ubuntu-slim"') }}
     timeout-minutes: 3
     env:
       HAS_APP_KEY: ${{ secrets.ROUTACT_APP_PRIVATE_KEY != '' }}
