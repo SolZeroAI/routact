@@ -31,6 +31,7 @@ Create a GitHub App owned by your organization (Settings → Developer settings 
 | Runners you check | App permission |
 | --- | --- |
 | Organization runners | Organization → **Self-hosted runners: Read** (Read and write for claims) |
+| `github-minutes` checks | Organization → **Administration: Read** |
 | Repository runners | Repository → **Administration: Read** (Read and write for claims) |
 
 No webhook is needed. Install the App on the organization, then save its id as the org variable `ROUTACT_APP_ID` and its private key as the org secret `ROUTACT_APP_PRIVATE_KEY`.
@@ -108,6 +109,7 @@ Leave the last step without conditions so there is always somewhere to run. If e
 | `{"var": "NAME"}` | The Actions variable `NAME` is set and not `false`, `0`, `no` or `off`. Add `"equals": "value"` to compare exactly. Needs the `vars` input (the reusable workflow passes it). |
 | `{"env": "NAME"}` | The environment variable `NAME` is set and truthy. Same options as `var`. |
 | `{"command": "..."}` | The shell command exits 0. Use this for your own logic. |
+| `"github-minutes"` | The organization's GitHub Actions usage this month is still inside its included minutes. `{"github-minutes": 10}` allows up to $10 of paid usage. See [GitHub-hosted minutes](#github-hosted-minutes). |
 | `{"not": check}` | The inner check fails. |
 | `{"any": [checks]}` | At least one inner check passes. |
 
@@ -134,6 +136,30 @@ Each check adds time to every route job, so keep slow checks out of it. For Blac
 
 1. Gate the Blacksmith step on `{"var": "ROUTACT_BLACKSMITH_ENABLED"}`.
 2. Set the org variable to `false` when the month's minutes run out, and back to `true` when they reset. You can do it by hand, or with a scheduled workflow that runs the [Blacksmith CLI](https://docs.blacksmith.sh/blacksmith-cli/usage) (`blacksmith usage`) and updates the variable with `gh variable set`.
+
+### GitHub-hosted minutes
+
+GitHub-hosted runners are always online, but their minutes are not free once the plan's included minutes are used up. Gate a GitHub-hosted step on `"github-minutes"`, and end the chain on the primary, so a job waits for your own runner instead of running on paid minutes:
+
+```json
+"linux-arm": {
+  "primary": "self-hosted,Linux,ARM64",
+  "primaries-required": 1,
+  "fallback": [
+    { "runs-on": "blacksmith-4vcpu-ubuntu-2404-arm", "when": { "var": "ROUTACT_BLACKSMITH_ENABLED" } },
+    { "runs-on": "ubuntu-24.04-arm", "when": "github-minutes" },
+    { "runs-on": "self-hosted,Linux,ARM64" }
+  ]
+}
+```
+
+The check reads the organization's [billing usage summary](https://docs.github.com/en/rest/billing/usage) for the current month and adds up the net amount of the Actions products, which is what you pay after the included minutes. It passes while that amount is 0, or at most the dollar amount you give.
+
+- The App needs the organization permission **Administration: Read**. The reusable workflow asks for it only when the config contains `github-minutes`.
+- The route job reads the usage once, however many steps check it.
+- When the usage cannot be read (no token, no organization, missing permission, API error), the check fails and the router moves on to the next step.
+- GitHub updates billing usage with a delay, so a few jobs can still start on paid minutes right after the included minutes run out.
+- The check counts the whole organization. Public repositories use GitHub-hosted runners for free, so do not route them through a pool that ends on a self-hosted runner.
 
 ### Fork pull requests
 

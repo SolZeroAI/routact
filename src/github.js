@@ -75,6 +75,42 @@ class RunnerClient {
   }
 }
 
+const BILLING_API_VERSION = '2026-03-10';
+
+// Dollars of this month's GitHub Actions usage that the organization pays for:
+// the net amount after the plan's included minutes. 0 means the included
+// minutes are not used up. Needs Administration: read on the organization.
+async function fetchActionsSpend({ token, organization, baseUrl = 'https://api.github.com', http, now = new Date() }) {
+  const client = http || new httpClient.HttpClient('routact', [], {
+    allowRetries: true,
+    maxRetries: 3,
+    socketTimeout: 15000,
+  });
+  const query = `product=actions&year=${now.getUTCFullYear()}&month=${now.getUTCMonth() + 1}`;
+  const url = `${baseUrl.replace(/\/$/, '')}/organizations/${organization}/settings/billing/usage/summary?${query}`;
+  let response;
+  try {
+    response = await client.getJson(url, {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': BILLING_API_VERSION,
+    });
+  } catch (error) {
+    response = { statusCode: error.statusCode, error };
+  }
+  if (response.statusCode !== 200) {
+    const hint = response.statusCode === 401 || response.statusCode === 403 || response.statusCode === 404
+      ? ' Check that the token has the organization permission Administration: read.'
+      : '';
+    const detail = response.error ? ` ${response.error.message.replace(/\.?$/, '.')}` : '';
+    throw new Error(`Failed to read GitHub Actions usage. Status code: ${response.statusCode}.${detail}${hint}`);
+  }
+  const items = (response.result && response.result.usageItems) || [];
+  return items
+    .filter((item) => String(item.product || '').toLowerCase() === 'actions')
+    .reduce((total, item) => total + (Number(item.netAmount) || 0), 0);
+}
+
 function assertOk(response, action) {
   if (response.statusCode !== 200 && response.statusCode !== 201) {
     const hint = response.statusCode === 401 || response.statusCode === 403 || response.statusCode === 404
@@ -94,4 +130,4 @@ function apiPathFor({ repository, organization, enterprise }) {
   return `repos/${repository}/actions/runners`;
 }
 
-module.exports = { RunnerClient, apiPathFor };
+module.exports = { RunnerClient, apiPathFor, fetchActionsSpend };

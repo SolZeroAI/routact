@@ -87,6 +87,8 @@ jobs:
           private-key: ${{ secrets.ROUTACT_APP_PRIVATE_KEY }}
           owner: ${{ inputs.organization || github.repository_owner }}
           permission-organization-self-hosted-runners: ${{ inputs.claim && 'write' || 'read' }}
+          # Only for "github-minutes" checks, which read the organization's billing usage
+          permission-organization-administration: ${{ contains(inputs.config || vars.ROUTACT_CONFIG, 'github-minutes') && 'read' || '' }}
 
       - name: Route
         id: route

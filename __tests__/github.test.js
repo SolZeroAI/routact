@@ -1,4 +1,4 @@
-const { RunnerClient, apiPathFor } = require('../src/github');
+const { RunnerClient, apiPathFor, fetchActionsSpend } = require('../src/github');
 
 function page(count, start = 0) {
   return Array.from({ length: count }, (_, i) => ({ id: start + i }));
@@ -39,5 +39,34 @@ describe('apiPathFor', () => {
     expect(apiPathFor({ repository: 'a/b', organization: 'o' })).toBe('orgs/o/actions/runners');
     expect(apiPathFor({ repository: 'a/b', enterprise: 'e' })).toBe('enterprises/e/actions/runners');
     expect(() => apiPathFor({ organization: 'o', enterprise: 'e' })).toThrow();
+  });
+});
+
+describe('fetchActionsSpend', () => {
+  it('sums the net Actions amount for the current month', async () => {
+    const http = {
+      getJson: jest.fn().mockResolvedValue({
+        statusCode: 200,
+        result: {
+          usageItems: [
+            { product: 'Actions', sku: 'actions_linux', netAmount: 1.5 },
+            { product: 'Actions', sku: 'actions_macos', netAmount: 2 },
+            { product: 'Packages', sku: 'packages_storage', netAmount: 7 },
+          ],
+        },
+      }),
+    };
+    const spent = await fetchActionsSpend({ token: 't', organization: 'o', http, now: new Date(Date.UTC(2026, 9, 30)) });
+    expect(spent).toBe(3.5);
+    expect(http.getJson.mock.calls[0][0])
+      .toBe('https://api.github.com/organizations/o/settings/billing/usage/summary?product=actions&year=2026&month=10');
+    expect(http.getJson.mock.calls[0][1]['X-GitHub-Api-Version']).toBe('2026-03-10');
+  });
+
+  it('explains permission errors', async () => {
+    const error = Object.assign(new Error('Resource not accessible by integration'), { statusCode: 403 });
+    const http = { getJson: jest.fn().mockRejectedValue(error) };
+    await expect(fetchActionsSpend({ token: 't', organization: 'o', http }))
+      .rejects.toThrow(/Status code: 403.*Administration: read/);
   });
 });
