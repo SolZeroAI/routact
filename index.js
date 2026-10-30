@@ -37,7 +37,7 @@ function readInputs() {
 
 function client({ token, organization, enterprise }) {
   if (!token) {
-    throw new Error('github-token is empty. Pass a GitHub App installation token (see README, "Token").');
+    throw new Error('github-token is empty. Pass a GitHub App installation token (see the README section "Create a GitHub App for the token").');
   }
   return new RunnerClient({
     token,

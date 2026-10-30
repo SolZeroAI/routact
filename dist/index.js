@@ -43,7 +43,7 @@ function readInputs() {
 
 function client({ token, organization, enterprise }) {
   if (!token) {
-    throw new Error('github-token is empty. Pass a GitHub App installation token (see README, "Token").');
+    throw new Error('github-token is empty. Pass a GitHub App installation token (see the README section "Create a GitHub App for the token").');
   }
   return new RunnerClient({
     token,
@@ -55059,9 +55059,9 @@ class RunnerClient {
 function assertOk(response, action) {
   if (response.statusCode !== 200 && response.statusCode !== 201) {
     const hint = response.statusCode === 401 || response.statusCode === 403 || response.statusCode === 404
-      ? ' Check that the token can access self-hosted runners for this scope (see README, "Token").'
+      ? ' Check that the token can access self-hosted runners for this scope (see the README section "Create a GitHub App for the token").'
       : '';
-    const detail = response.error ? ` ${response.error.message}` : '';
+    const detail = response.error ? ` ${response.error.message.replace(/\.?$/, '.')}` : '';
     throw new Error(`Failed to ${action}. Status code: ${response.statusCode}.${detail}${hint}`);
   }
 }
