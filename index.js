@@ -1,5 +1,5 @@
 const core = require('@actions/core');
-const { RunnerClient, apiPathFor } = require('./src/github');
+const { RunnerClient, apiPathFor, fetchActionsSpend } = require('./src/github');
 const { parseConfig, resolvePools } = require('./src/config');
 const { isForkPullRequest } = require('./src/event');
 const { ConfigError, routePools, fallbackResults, parseClaims } = require('./src/route');
@@ -21,14 +21,17 @@ function readInputs() {
   if (!(checkTimeoutSeconds > 0)) {
     throw new ConfigError(`check-timeout-seconds must be a positive number, got "${core.getInput('check-timeout-seconds')}"`);
   }
+  const token = core.getInput('github-token');
+  const organization = core.getInput('organization') || (config && config.organization);
   return {
-    token: core.getInput('github-token'),
+    token,
     checkContext: {
       vars: parseVars(core.getInput('vars')),
+      githubUsage: token && organization ? githubUsage({ token, organization }) : undefined,
       timeoutSeconds: checkTimeoutSeconds,
       log: (message) => core.info(message),
     },
-    organization: core.getInput('organization') || (config && config.organization),
+    organization,
     enterprise: core.getInput('enterprise') || (config && config.enterprise),
     pools: resolvePools({
       primaryRunner: core.getInput('primary-runner'),
@@ -42,6 +45,24 @@ function readInputs() {
     platformCheck,
     claim: core.getBooleanInput('claim'),
     claimTtlMs: claimTtlMinutes * 60 * 1000,
+  };
+}
+
+// Reads the usage once per run, however many steps check it
+function githubUsage({ token, organization }) {
+  let pending;
+  return () => {
+    if (!pending) {
+      pending = fetchActionsSpend({
+        token,
+        organization,
+        baseUrl: process.env.GITHUB_API_URL || 'https://api.github.com',
+      }).then((spent) => {
+        core.info(`GitHub Actions usage this month for ${organization}: $${spent.toFixed(2)} past the included minutes`);
+        return spent;
+      });
+    }
+    return pending;
   };
 }
 

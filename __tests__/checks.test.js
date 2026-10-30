@@ -12,6 +12,8 @@ describe('normalizeWhen', () => {
     ['idle', ['idle']],
     [{ var: 'X' }, [{ var: 'X' }]],
     [[{ var: 'X' }, { env: 'Y' }], [{ var: 'X' }, { env: 'Y' }]],
+    ['github-minutes', ['github-minutes']],
+    [{ 'github-minutes': 10 }, [{ 'github-minutes': 10 }]],
   ])('accepts %j', (when, expected) => {
     expect(normalizeWhen(when, 'test')).toEqual(expected);
   });
@@ -23,6 +25,8 @@ describe('normalizeWhen', () => {
     [{ command: '' }],
     [{ any: [] }],
     [{ not: { nope: 1 } }],
+    [{ 'github-minutes': -1 }],
+    [{ 'github-minutes': '5' }],
   ])('rejects %j', (when) => {
     expect(() => normalizeWhen(when, 'test')).toThrow(ConfigError);
   });
@@ -46,6 +50,23 @@ describe('evaluate', () => {
     const idleCount = (labels) => (labels[0] === 'big' ? 2 : 0);
     expect(await evaluate('idle', step(['big']), context({ idleCount }))).toBe(true);
     expect(await evaluate({ idle: 3 }, step(['big']), context({ idleCount }))).toBe(false);
+  });
+
+  it('passes while GitHub Actions usage is within the included minutes or the spend limit', async () => {
+    const githubUsage = jest.fn().mockResolvedValue(4.5);
+    expect(await evaluate('github-minutes', step([]), context({ githubUsage }))).toBe(false);
+    expect(await evaluate({ 'github-minutes': 5 }, step([]), context({ githubUsage }))).toBe(true);
+    expect(await evaluate({ 'github-minutes': 4 }, step([]), context({ githubUsage }))).toBe(false);
+    const unused = jest.fn().mockResolvedValue(0);
+    expect(await evaluate('github-minutes', step([]), context({ githubUsage: unused }))).toBe(true);
+  });
+
+  it('fails a GitHub minutes check when usage cannot be read', async () => {
+    const log = jest.fn();
+    expect(await evaluate('github-minutes', step([]), context({ log }))).toBe(false);
+    const githubUsage = jest.fn().mockRejectedValue(new Error('Status code: 403'));
+    expect(await evaluate('github-minutes', step([]), context({ githubUsage, log }))).toBe(false);
+    expect(log).toHaveBeenLastCalledWith('Could not read GitHub usage: Status code: 403');
   });
 
   it('combines checks with not and any', async () => {

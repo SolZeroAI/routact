@@ -5,7 +5,7 @@ require('./sourcemap-register.js');/******/ (() => { // webpackBootstrap
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 const core = __nccwpck_require__(7484);
-const { RunnerClient, apiPathFor } = __nccwpck_require__(6474);
+const { RunnerClient, apiPathFor, fetchActionsSpend } = __nccwpck_require__(6474);
 const { parseConfig, resolvePools } = __nccwpck_require__(1283);
 const { isForkPullRequest } = __nccwpck_require__(4281);
 const { ConfigError, routePools, fallbackResults, parseClaims } = __nccwpck_require__(1904);
@@ -27,14 +27,17 @@ function readInputs() {
   if (!(checkTimeoutSeconds > 0)) {
     throw new ConfigError(`check-timeout-seconds must be a positive number, got "${core.getInput('check-timeout-seconds')}"`);
   }
+  const token = core.getInput('github-token');
+  const organization = core.getInput('organization') || (config && config.organization);
   return {
-    token: core.getInput('github-token'),
+    token,
     checkContext: {
       vars: parseVars(core.getInput('vars')),
+      githubUsage: token && organization ? githubUsage({ token, organization }) : undefined,
       timeoutSeconds: checkTimeoutSeconds,
       log: (message) => core.info(message),
     },
-    organization: core.getInput('organization') || (config && config.organization),
+    organization,
     enterprise: core.getInput('enterprise') || (config && config.enterprise),
     pools: resolvePools({
       primaryRunner: core.getInput('primary-runner'),
@@ -48,6 +51,24 @@ function readInputs() {
     platformCheck,
     claim: core.getBooleanInput('claim'),
     claimTtlMs: claimTtlMinutes * 60 * 1000,
+  };
+}
+
+// Reads the usage once per run, however many steps check it
+function githubUsage({ token, organization }) {
+  let pending;
+  return () => {
+    if (!pending) {
+      pending = fetchActionsSpend({
+        token,
+        organization,
+        baseUrl: process.env.GITHUB_API_URL || 'https://api.github.com',
+      }).then((spent) => {
+        core.info(`GitHub Actions usage this month for ${organization}: $${spent.toFixed(2)} past the included minutes`);
+        return spent;
+      });
+    }
+    return pending;
   };
 }
 
@@ -54880,6 +54901,9 @@ const { ConfigError } = __nccwpck_require__(438);
 //   {"var": "NAME", "equals": "x"}  variable NAME is exactly "x"
 //   {"env": "NAME"}                 environment variable NAME is truthy (same options as var)
 //   {"command": "..."}              shell command exits 0, for your own logic
+//   "github-minutes"                the organization's GitHub Actions usage this
+//                                   month is still inside its included minutes
+//   {"github-minutes": 10}          paid Actions usage this month is at most $10
 //   {"not": <check>}                the inner check fails
 //   {"any": [<check>, ...]}         at least one inner check passes
 
@@ -54887,13 +54911,17 @@ const FALSY = ['', '0', 'false', 'no', 'off'];
 const DEFAULT_COMMAND_TIMEOUT_SECONDS = 20;
 
 function validate(check, where) {
-  if (check === 'idle') return;
+  if (check === 'idle' || check === 'github-minutes') return;
   if (!check || typeof check !== 'object' || Array.isArray(check)) {
     throw new ConfigError(`${where}: unknown check ${JSON.stringify(check)}`);
   }
-  const kinds = ['idle', 'var', 'env', 'command', 'not', 'any'].filter((kind) => kind in check);
+  const kinds = ['idle', 'var', 'env', 'command', 'github-minutes', 'not', 'any'].filter((kind) => kind in check);
   if (kinds.length !== 1) {
-    throw new ConfigError(`${where}: a check needs exactly one of idle, var, env, command, not, any; got ${JSON.stringify(check)}`);
+    throw new ConfigError(`${where}: a check needs exactly one of idle, var, env, command, github-minutes, not, any; got ${JSON.stringify(check)}`);
+  }
+  const maxSpend = check['github-minutes'];
+  if (maxSpend !== undefined && !(typeof maxSpend === 'number' && Number.isFinite(maxSpend) && maxSpend >= 0)) {
+    throw new ConfigError(`${where}: "github-minutes" needs a dollar amount of at least 0`);
   }
   if (check.not !== undefined) validate(check.not, where);
   if (check.any !== undefined) {
@@ -54924,6 +54952,8 @@ function compareValue(value, check) {
 
 function describe(check) {
   if (check === 'idle') return 'idle runner';
+  if (check === 'github-minutes') return 'GitHub included minutes';
+  if (check['github-minutes'] !== undefined) return `GitHub paid minutes up to $${check['github-minutes']}`;
   if (check.idle !== undefined) return `${check.idle} idle runners`;
   if (check.var !== undefined) return `var ${check.var}`;
   if (check.env !== undefined) return `env ${check.env}`;
@@ -54961,9 +54991,30 @@ function runCommand(command, { env = {}, timeoutSeconds = DEFAULT_COMMAND_TIMEOU
   });
 }
 
-// context: {idleCount(labels), vars, env, commandEnv, timeoutSeconds, log, run}
+// Passes while the paid part of this month's Actions usage is at most maxSpend
+// dollars. Fails when the usage cannot be read (no token, no organization,
+// missing permission), so the router moves on to the next step.
+async function withinGitHubMinutes(maxSpend, context) {
+  const log = context.log || (() => {});
+  if (!context.githubUsage) {
+    log('GitHub usage is not available here (it needs an organization and a token with Administration: read)');
+    return false;
+  }
+  let spent;
+  try {
+    spent = await context.githubUsage();
+  } catch (error) {
+    log(`Could not read GitHub usage: ${error.message}`);
+    return false;
+  }
+  return spent <= maxSpend;
+}
+
+// context: {idleCount(labels), vars, env, commandEnv, githubUsage(), timeoutSeconds, log, run}
 async function evaluate(check, step, context) {
   if (check === 'idle') return context.idleCount(step.labels) >= 1;
+  if (check === 'github-minutes') return withinGitHubMinutes(0, context);
+  if (check['github-minutes'] !== undefined) return withinGitHubMinutes(check['github-minutes'], context);
   if (check.idle !== undefined) return context.idleCount(step.labels) >= check.idle;
   if (check.var !== undefined) return compareValue((context.vars || {})[check.var], check);
   if (check.env !== undefined) return compareValue((context.env || process.env)[check.env], check);
@@ -55262,6 +55313,42 @@ class RunnerClient {
   }
 }
 
+const BILLING_API_VERSION = '2026-03-10';
+
+// Dollars of this month's GitHub Actions usage that the organization pays for:
+// the net amount after the plan's included minutes. 0 means the included
+// minutes are not used up. Needs Administration: read on the organization.
+async function fetchActionsSpend({ token, organization, baseUrl = 'https://api.github.com', http, now = new Date() }) {
+  const client = http || new httpClient.HttpClient('routact', [], {
+    allowRetries: true,
+    maxRetries: 3,
+    socketTimeout: 15000,
+  });
+  const query = `product=actions&year=${now.getUTCFullYear()}&month=${now.getUTCMonth() + 1}`;
+  const url = `${baseUrl.replace(/\/$/, '')}/organizations/${organization}/settings/billing/usage/summary?${query}`;
+  let response;
+  try {
+    response = await client.getJson(url, {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': BILLING_API_VERSION,
+    });
+  } catch (error) {
+    response = { statusCode: error.statusCode, error };
+  }
+  if (response.statusCode !== 200) {
+    const hint = response.statusCode === 401 || response.statusCode === 403 || response.statusCode === 404
+      ? ' Check that the token has the organization permission Administration: read.'
+      : '';
+    const detail = response.error ? ` ${response.error.message.replace(/\.?$/, '.')}` : '';
+    throw new Error(`Failed to read GitHub Actions usage. Status code: ${response.statusCode}.${detail}${hint}`);
+  }
+  const items = (response.result && response.result.usageItems) || [];
+  return items
+    .filter((item) => String(item.product || '').toLowerCase() === 'actions')
+    .reduce((total, item) => total + (Number(item.netAmount) || 0), 0);
+}
+
 function assertOk(response, action) {
   if (response.statusCode !== 200 && response.statusCode !== 201) {
     const hint = response.statusCode === 401 || response.statusCode === 403 || response.statusCode === 404
@@ -55281,7 +55368,7 @@ function apiPathFor({ repository, organization, enterprise }) {
   return `repos/${repository}/actions/runners`;
 }
 
-module.exports = { RunnerClient, apiPathFor };
+module.exports = { RunnerClient, apiPathFor, fetchActionsSpend };
 
 
 /***/ }),

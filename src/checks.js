@@ -9,6 +9,9 @@ const { ConfigError } = require('./errors');
 //   {"var": "NAME", "equals": "x"}  variable NAME is exactly "x"
 //   {"env": "NAME"}                 environment variable NAME is truthy (same options as var)
 //   {"command": "..."}              shell command exits 0, for your own logic
+//   "github-minutes"                the organization's GitHub Actions usage this
+//                                   month is still inside its included minutes
+//   {"github-minutes": 10}          paid Actions usage this month is at most $10
 //   {"not": <check>}                the inner check fails
 //   {"any": [<check>, ...]}         at least one inner check passes
 
@@ -16,13 +19,17 @@ const FALSY = ['', '0', 'false', 'no', 'off'];
 const DEFAULT_COMMAND_TIMEOUT_SECONDS = 20;
 
 function validate(check, where) {
-  if (check === 'idle') return;
+  if (check === 'idle' || check === 'github-minutes') return;
   if (!check || typeof check !== 'object' || Array.isArray(check)) {
     throw new ConfigError(`${where}: unknown check ${JSON.stringify(check)}`);
   }
-  const kinds = ['idle', 'var', 'env', 'command', 'not', 'any'].filter((kind) => kind in check);
+  const kinds = ['idle', 'var', 'env', 'command', 'github-minutes', 'not', 'any'].filter((kind) => kind in check);
   if (kinds.length !== 1) {
-    throw new ConfigError(`${where}: a check needs exactly one of idle, var, env, command, not, any; got ${JSON.stringify(check)}`);
+    throw new ConfigError(`${where}: a check needs exactly one of idle, var, env, command, github-minutes, not, any; got ${JSON.stringify(check)}`);
+  }
+  const maxSpend = check['github-minutes'];
+  if (maxSpend !== undefined && !(typeof maxSpend === 'number' && Number.isFinite(maxSpend) && maxSpend >= 0)) {
+    throw new ConfigError(`${where}: "github-minutes" needs a dollar amount of at least 0`);
   }
   if (check.not !== undefined) validate(check.not, where);
   if (check.any !== undefined) {
@@ -53,6 +60,8 @@ function compareValue(value, check) {
 
 function describe(check) {
   if (check === 'idle') return 'idle runner';
+  if (check === 'github-minutes') return 'GitHub included minutes';
+  if (check['github-minutes'] !== undefined) return `GitHub paid minutes up to $${check['github-minutes']}`;
   if (check.idle !== undefined) return `${check.idle} idle runners`;
   if (check.var !== undefined) return `var ${check.var}`;
   if (check.env !== undefined) return `env ${check.env}`;
@@ -90,9 +99,30 @@ function runCommand(command, { env = {}, timeoutSeconds = DEFAULT_COMMAND_TIMEOU
   });
 }
 
-// context: {idleCount(labels), vars, env, commandEnv, timeoutSeconds, log, run}
+// Passes while the paid part of this month's Actions usage is at most maxSpend
+// dollars. Fails when the usage cannot be read (no token, no organization,
+// missing permission), so the router moves on to the next step.
+async function withinGitHubMinutes(maxSpend, context) {
+  const log = context.log || (() => {});
+  if (!context.githubUsage) {
+    log('GitHub usage is not available here (it needs an organization and a token with Administration: read)');
+    return false;
+  }
+  let spent;
+  try {
+    spent = await context.githubUsage();
+  } catch (error) {
+    log(`Could not read GitHub usage: ${error.message}`);
+    return false;
+  }
+  return spent <= maxSpend;
+}
+
+// context: {idleCount(labels), vars, env, commandEnv, githubUsage(), timeoutSeconds, log, run}
 async function evaluate(check, step, context) {
   if (check === 'idle') return context.idleCount(step.labels) >= 1;
+  if (check === 'github-minutes') return withinGitHubMinutes(0, context);
+  if (check['github-minutes'] !== undefined) return withinGitHubMinutes(check['github-minutes'], context);
   if (check.idle !== undefined) return context.idleCount(step.labels) >= check.idle;
   if (check.var !== undefined) return compareValue((context.vars || {})[check.var], check);
   if (check.env !== undefined) return compareValue((context.env || process.env)[check.env], check);
