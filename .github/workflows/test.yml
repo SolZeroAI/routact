@@ -3,52 +3,58 @@ on:
   pull_request:
   push:
     branches:
-      - main
+      - master
       - 'releases/*'
 
 jobs:
-  # unit tests
   units:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
+    - uses: actions/setup-node@v5
+      with:
+        node-version: 24
     - run: npm ci
+    - run: npm run lint
     - run: npm test
 
-  # test action works running from the graph
+  # Runs the built action on the same small runner the route job uses. The
+  # workflow token cannot read runners, so this exercises fallback-on-error.
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     outputs:
       use-runner: ${{ steps.test-action.outputs.use-runner }}
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - id: test-action
       uses: ./
       with:
-        primary-runner: 'self-hosted,linux'
-        fallback-runner: 'ubuntu-latest'
-        github-token: ${{ secrets.TEST_GITHUB_TOKEN }}
+        primary-runner: 'self-hosted,Linux,X64'
+        fallback-runner: 'ubuntu-24.04'
+        fallback-on-error: true
+        github-token: ${{ secrets.TEST_GITHUB_TOKEN || github.token }}
     - name: Check output
-      run: echo "Runner to use is ${{ steps.test-action.outputs.use-runner }}"        
+      run: echo "Runner to use is ${{ steps.test-action.outputs.use-runner }} (${{ steps.test-action.outputs.reason }})"
 
   test-output:
     needs: test
-    runs-on: ${{ fromJson(needs.test.outputs.use-runner )}}
+    runs-on: ${{ fromJson(needs.test.outputs.use-runner) }}
     steps:
       - name: Do something
         run: echo "Doing something on ${{ needs.test.outputs.use-runner }}"
 
-  test-multiple-labels:
-    runs-on: ubuntu-latest
-    outputs:
-      use-runner: ${{ steps.test-action.outputs.use-runner }}
+  test-platform-check:
+    runs-on: ubuntu-slim
     steps:
-    - uses: actions/checkout@v4
-    - id: test-action
+    - uses: actions/checkout@v5
+    - id: mismatch
       uses: ./
+      continue-on-error: true
       with:
-        primary-runner: 'self-hosted,linux'
-        fallback-runner: 'linux,x64'
-        github-token: ${{ secrets.TEST_GITHUB_TOKEN }}
-    - name: Check output
-      run: echo "Runner to use is ${{ steps.test-action.outputs.use-runner }}"        
+        primary-runner: 'self-hosted,macOS,ARM64'
+        fallback-runner: 'ubuntu-latest'
+        fallback-on-error: true
+        github-token: ${{ github.token }}
+    - name: A cross-platform fallback must fail
+      if: steps.mismatch.outcome != 'failure'
+      run: exit 1

@@ -1,111 +1,205 @@
-# Github Runner Fallback Action
+# Routact
 
 <p align="center">
-  <a href="https://github.com/mikehardy/runner-fallback-action/actions"><img alt="javscript-action status" src="https://github.com/mikehardy/runner-fallback-action/workflows/units-test/badge.svg"></a>
+  <a href="https://github.com/SolZeroAI/routact/actions"><img alt="units-test status" src="https://github.com/SolZeroAI/routact/workflows/units-test/badge.svg"></a>
 </p>
 
-Github action to determine the availability of self-hosted runners, and fallback to a GitHub runner if the primary runners are offline.
+Route GitHub Actions jobs to your self-hosted runners when they are free, and to a runner of the same OS and CPU architecture when they are not.
 
-This action uses [GitHub API](https://docs.github.com/en/rest/actions/self-hosted-runners?apiVersion=2022-11-28#list-self-hosted-runners-for-a-repository) to check the statuses of self hosted-runners that match specific labels, and outputs the runner label(s), or a fallback runner if the self-hosted runner(s) is unavailable.
+GitHub cannot move a job once it is queued, so routing has to happen before the job starts. Routact runs as a small first job that checks your runners through the [self-hosted runners API](https://docs.github.com/en/rest/actions/self-hosted-runners) and outputs labels for `runs-on: ${{ fromJson(...) }}` in later jobs.
 
-The API used requires an access token with org admin rights, for example a classic Personal Access Token with org:admin scope selected.
+Routact started as a fork of [mikehardy/runner-fallback-action](https://github.com/mikehardy/runner-fallback-action) (originally by [@jimmygchen](https://github.com/jimmygchen)) and keeps its inputs and outputs, so it works as a drop-in replacement.
 
-This output can then used on the `runs-on` property of subsequent jobs.
+## What it adds
 
-Note: In order to support an array of labels for the `runs-on` field, the output is formatted as a JSON string and needs to be parsed using `fromJson`. See example usage below.
+- **Bug fixes.** Busy runners were always skipped even without `primaries-required`; only the first 30 runners were read; a multi-label fallback broke on errors; labels were matched case-sensitively.
+- **GitHub App tokens** instead of an org-admin personal access token.
+- **Fork pull requests always use the fallback**, without calling the API. They get no secrets anyway, and running untrusted code on self-hosted runners is unsafe.
+- **Same-platform fallback.** Routact refuses a fallback whose OS or architecture differs from the primary (for example a Mac pool falling back to `ubuntu-latest`).
+- **Several pools in one call**, with shared rules kept in one org variable.
+- **Runner claims**, an opt-in lock that stops two concurrent runs from picking the same idle runner.
+- **A reusable route job** on `ubuntu-slim`, the smallest and fastest-starting GitHub-hosted runner.
+- `node24`, retries and timeouts on API calls, and a job summary table.
 
-## Usage
+## Quick start
 
-### ✏️ Inputs
+### 1. Create a GitHub App for the token
 
-#### Required
+Create a GitHub App owned by your organization (Settings → Developer settings → GitHub Apps) with:
 
-|       Name        |                                          Description                                                       |
-| ----------------- | ---------------------------------------------------------------------------------------------------------- |
-|  `github-token`   | A token that can access the `list action runners` for the given context (e.g. user repo, org, enterprise). |
-|  `primary-runner` | A comma separated list of labels for the _primary_ runner (e.g. 'self-hosted,linux').                      |
-| `fallback-runner` | A comma separated list of labels for the _fallback_ runner (e.g. 'self-hosted,linux').                     |
+| Runners you check | App permission |
+| --- | --- |
+| Organization runners | Organization → **Self-hosted runners: Read** (Read and write for claims) |
+| Repository runners | Repository → **Administration: Read** (Read and write for claims) |
 
-#### Optional
+No webhook is needed. Install the App on the organization, then save its id as the org variable `ROUTACT_APP_ID` and its private key as the org secret `ROUTACT_APP_PRIVATE_KEY`.
 
----
+For enterprise-level runners, use a token with `manage_runners:enterprise` (a personal access token, or an enterprise-installed App if your enterprise has one).
 
-There are three ways runners can be allowed to run against a repo: User, Organization, Enterprise. The following options allow you to switch the implementation to use one of the other specified levels. **_Note:_** You can only provide one of the values.
+### 2. Put your routing rules in an org variable
 
-|       Name       |                     Description                                    |
-| ---------------- | ------------------------------------------------------------------ |
-| `organization`   | The name of the github organization (e.g. `My-Github-Org`)         |
-| `enterprise`     | The name of the github enterprise (e.g. `My-Github-Ent`)           |
+Save this as the org variable `ROUTACT_CONFIG` (Settings → Secrets and variables → Actions → Variables):
 
-It is possible that you want to use the fallback runners even if the primary runners are online,
-if the primary runners are busy. You may optionally configure this action to fallback if there
-are not enough free primaries, for example if you are adding self-hosted primaries to increase capacity, but the fallbacks are public runners in a public repo so you don't mind using them as needed.
+```json
+{
+  "organization": "your-org",
+  "pools": {
+    "linux-x64": { "primary": "self-hosted,Linux,X64", "fallback": "ubuntu-24.04" },
+    "linux-arm": { "primary": "self-hosted,Linux,ARM64", "fallback": "ubuntu-24.04-arm", "primaries-required": 1 },
+    "mac": { "primary": "self-hosted,macOS,ARM64", "fallback": "macos-15", "primaries-required": 1 }
+  }
+}
+```
 
-|       Name           |                     Description                 |
-| -------------------- | ----------------------------------------------- |
-| `primaries-required` | minimum non-busy primaries count, else fallback |
+Each pool has `primary` labels, `fallback` labels, and optionally `primaries-required` (see [Inputs](#inputs)). Labels can be a comma-separated string or an array.
 
-You may want the action to use the fallback runner, if correctly configured, if there are any
-errors at all. This makes it so the action won't block CI runs even if (for example) the
-github token is unavailable or expires. Default is false.
-
-|       Name          |                     Description                 |
-| ------------------- | ----------------------------------------------- |
-| `fallback-on-error` | use the fallback runner if there are any errors |
-
-### Example
+### 3. Add the route job to a workflow
 
 ```yaml
 jobs:
-  # We may have a self-hosted runner available. Use it if so.
-  determine-runner:
-    runs-on: ubuntu-latest
-    concurrency:
-      # Runner choice must happen serially for the "primaries-required" logic
-      # to be up to date in the context of one self-hosted runner that may be
-      # used for multiple workflows triggered off the same workflow event
-      group: runner-determination
-      cancel-in-progress: false
-    outputs:
-      runner: ${{ steps.set-runner.outputs.use-runner }}
-    steps:
-      - name: Wait for possible parallel workflow run job startup lag
-        # After runner choice, the job that will use it has unavoidable job startup lag
-        # Wait for that job start / runner state change before we choose the runner for this run
-        run: sleep 15
-      - name: Use self-hosted runner if online and not busy, otherwise public runner
-        id: set-runner
-        uses: mikehardy/runner-fallback-action@v1
-        with:
-          organization: "ankidroid"
-          # list of tags a runner must match to be considered a primary
-          primary-runner: "macos-selfhosted"
-          # a single tag that will select a runner to fallback to
-          fallback-runner: "macos-26"
-          # optional, fallback if fewer available, big batch jobs or multiple workflows perhaps
-          primaries-required: 1
-          # optional, fallback if token expires or github API fails
-          fallback-on-error: true
-          # Must have org:admin permissions, github runner APIs require it
-          # Note that Actions secrets and Dependabot secrets are separate
-          github-token: ${{ secrets.MIKE_HARDY_ORG_ADMIN_KEY }}
+  route:
+    uses: SolZeroAI/routact/.github/workflows/route.yml@master
+    secrets: inherit
 
-  another-job:
-    needs: determine-runner
-    runs-on: ${{ fromJson(needs.determine-runner.outputs.runner) }}
+  build:
+    needs: route
+    runs-on: ${{ fromJson(needs.route.outputs.runners)['linux-x64'] }}
     steps:
-      - name: Do something
-        run: echo "Doing something on ${{ needs.determine-runner.outputs.runner }}"
+      - run: echo "Building on ${{ runner.name }}"
+
+  test-mac:
+    needs: route
+    runs-on: ${{ fromJson(needs.route.outputs.runners)['mac'] }}
+    steps:
+      - run: echo "Testing on ${{ runner.name }}"
 ```
 
-- Here is an example of the action in use directly: <https://github.com/ankidroid/Anki-Android-Backend/blob/main/.github/workflows/build-release.yml>
+One route job serves every pool in the workflow with a single API call.
 
-- Here is an example where the runner is used in a second preparation step that builds a dynamic job matrix where the runner is used in javascript: <https://github.com/ankidroid/Anki-Android-Backend/blob/main/.github/workflows/build-quick.yml>
+## Using the action directly
+
+The reusable workflow is a thin wrapper. You can call the action yourself, for example with a single pool:
+
+```yaml
+jobs:
+  route:
+    runs-on: ubuntu-slim
+    timeout-minutes: 3
+    outputs:
+      runner: ${{ steps.route.outputs.use-runner }}
+    steps:
+      - id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.ROUTACT_APP_ID }}
+          private-key: ${{ secrets.ROUTACT_APP_PRIVATE_KEY }}
+          permission-organization-self-hosted-runners: read
+      - id: route
+        uses: SolZeroAI/routact@master
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          organization: your-org
+          primary-runner: self-hosted,macOS,ARM64
+          fallback-runner: macos-15
+          primaries-required: 1
+          fallback-on-error: true
+
+  build:
+    needs: route
+    runs-on: ${{ fromJson(needs.route.outputs.runner) }}
+    steps:
+      - run: echo "Building"
+```
+
+Keep the route job on a GitHub-hosted runner. If it ran on the self-hosted pool it is checking, it could never route away from that pool when the pool is full.
+
+Fork pull requests get no secrets, so the token step fails for them. Add `if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'` to the token step; Routact sends fork PRs to the fallback without a token. The reusable workflow already does this.
+
+## Runner claims
+
+With `primaries-required`, two workflows that start together can both see the same idle runner and both route to it, so one waits. Upstream suggested a `concurrency` group plus `sleep 15`, which serializes every run and still guesses at timing.
+
+With `claim: true`, Routact instead:
+
+1. Picks an idle runner that has no live claim, and adds a unique label to it, such as `routact-claim-1793750400-123456-1-k3x9zq`.
+2. Reads the runner again. If its claim is the only live claim, it wins. If another run claimed the runner at the same moment, both back off and try the next idle runner (or fall back). Two runs can both lose a race, but never both win.
+3. Outputs the claim label as the runner label, so the job can only run on that exact runner.
+
+Claims expire after `claim-ttl-minutes` (default 10) and are removed by the next route job. To free the runner sooner, release the claim at the end of the job:
+
+```yaml
+  build:
+    needs: route
+    runs-on: ${{ fromJson(needs.route.outputs.runners)['mac'] }}
+    steps:
+      - run: make build
+      - name: Release runner claim
+        if: always() && needs.route.outputs.claims != ''
+        uses: SolZeroAI/routact@master
+        with:
+          release: ${{ needs.route.outputs.claims }}
+          organization: your-org
+          github-token: ${{ secrets.ROUTACT_TOKEN }}  # or an App token with write access
+```
+
+Things to know:
+
+- Claims need **write** access to runners (App permission Self-hosted runners: Read and write).
+- A claimed job targets one runner. If that runner goes offline before the job starts, the job waits until it times out, so set `timeout-minutes` on jobs that use claims.
+- Runners whose labels cannot be edited (for example Actions Runner Controller scale sets) cannot be claimed.
+
+## Inputs
+
+| Name | Default | Description |
+| --- | --- | --- |
+| `github-token` | | Token that can read runners for the chosen scope. Not needed for fork PRs. |
+| `primary-runner` | | Comma-separated labels of the primary runner, e.g. `self-hosted,Linux,X64`. Use with `fallback-runner`, or use `config`. |
+| `fallback-runner` | | Comma-separated labels of the fallback, e.g. `ubuntu-24.04`. |
+| `primaries-required` | | Fall back unless at least this many matching primaries are online **and idle**. Empty means any online primary is enough, even a busy one. |
+| `config` | | JSON routing rules with named pools (see Quick start). |
+| `pools` | all | Comma-separated pool names from `config` to route. |
+| `organization` | | Check this organization's runners. Default is the repository's runners, or the `organization` in `config`. |
+| `enterprise` | | Check this enterprise's runners. |
+| `fallback-on-error` | `false` | Use the fallback if the runner check fails (expired token, API outage). Configuration errors still fail the job. |
+| `fallback-on-fork-pr` | `true` | Always use the fallback for pull requests from forks. |
+| `platform-check` | `error` | When the fallback's OS or architecture differs from the primary: `error`, `warn` or `off`. |
+| `claim` | `false` | Claim a specific idle runner (see [Runner claims](#runner-claims)). |
+| `claim-ttl-minutes` | `10` | Minutes before an unreleased claim expires. |
+| `release` | | Release these claims instead of routing. |
+
+## Outputs
+
+| Name | Description |
+| --- | --- |
+| `use-runner` | JSON label array for `runs-on`, read with `fromJson`. Set when exactly one pool is routed. |
+| `is-primary` | `true` when the primary was chosen (single pool). |
+| `runner-name` | The chosen runner's name, when known (single pool). |
+| `reason` | Why this runner was chosen (single pool). |
+| `runners` | JSON object of pool name to label array. The single-pool inputs use the pool name `default`. |
+| `details` | JSON object of pool name to `{labels, isPrimary, runnerName, claim, reason}`. |
+| `claims` | Comma-separated claims made by this run, for `release`. |
+
+## How the platform check works
+
+Routact works out each side's OS and architecture:
+
+- For a registered self-hosted runner, from the OS it reports and its `X64`/`ARM64` label.
+- For GitHub-hosted labels, from the image name: `ubuntu-*` is Linux X64, `*-arm` is ARM64, `macos-14` and newer are Apple silicon, `macos-13`, `*-intel` and `*-large` are Intel, `windows-*` is Windows X64.
+- For other providers, from words in the label such as `ubuntu`, `macos`, `arm64` or `x64`.
+
+If either side cannot be fully determined, Routact warns instead of failing. Add the default OS and architecture labels (for example `Linux,X64`) to your primary labels to make the check exact.
+
+## Development
+
+```bash
+npm ci
+npm run all   # lint, build dist/, test
+```
+
+`dist/` is checked in because Actions runs it directly; rebuild it with `npm run prepare` before committing.
 
 ## Credit
 
-- this action is based on the pattern described by @ianpurton on [this feature request thread](https://github.com/orgs/community/discussions/20019#discussioncomment-5414593).
-
-- this action was originally developed by @jimmygchen - thanks Jimmy! [He has decided to archive his original action](https://github.com/jimmygchen/runner-fallback-action/pull/31#issuecomment-3454512133), and this fork is the successor
-
-- @O-Mutt contributed the organization-level and enterprise-level self-hosted runner feature, thanks Matt!
+- Based on the pattern described by @ianpurton on [this feature request thread](https://github.com/orgs/community/discussions/20019#discussioncomment-5414593).
+- Originally developed by @jimmygchen, continued by @mikehardy as [runner-fallback-action](https://github.com/mikehardy/runner-fallback-action).
+- @O-Mutt contributed the organization-level and enterprise-level runner support.

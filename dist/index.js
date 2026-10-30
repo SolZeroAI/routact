@@ -5,135 +5,173 @@ require('./sourcemap-register.js');/******/ (() => { // webpackBootstrap
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 const core = __nccwpck_require__(7484);
-const httpClient = __nccwpck_require__(4844);
+const { RunnerClient, apiPathFor } = __nccwpck_require__(6474);
+const { parseConfig, resolvePools } = __nccwpck_require__(1283);
+const { isForkPullRequest } = __nccwpck_require__(4281);
+const { ConfigError, routePools, fallbackResults, parseClaims } = __nccwpck_require__(1904);
 
-async function checkRunner({
-  token,
-  primaryRunnerLabels,
-  fallbackRunner,
-  primariesRequired,
-  apiPath,
-}) {
-  const http = new httpClient.HttpClient("http-client");
-  const headers = {
-    Authorization: `Bearer ${token}`,
+const PLATFORM_CHECKS = ['error', 'warn', 'off'];
+
+function readInputs() {
+  const config = parseConfig(core.getInput('config'));
+  const platformCheck = (core.getInput('platform-check') || 'error').toLowerCase();
+  if (!PLATFORM_CHECKS.includes(platformCheck)) {
+    throw new ConfigError(`platform-check must be one of ${PLATFORM_CHECKS.join(', ')}, got "${platformCheck}"`);
+  }
+  const claimTtlMinutes = Number(core.getInput('claim-ttl-minutes') || 10);
+  if (!(claimTtlMinutes > 0)) {
+    throw new ConfigError(`claim-ttl-minutes must be a positive number, got "${core.getInput('claim-ttl-minutes')}"`);
+  }
+  return {
+    token: core.getInput('github-token'),
+    organization: core.getInput('organization') || (config && config.organization),
+    enterprise: core.getInput('enterprise') || (config && config.enterprise),
+    pools: resolvePools({
+      primaryRunner: core.getInput('primary-runner'),
+      fallbackRunner: core.getInput('fallback-runner'),
+      primariesRequired: core.getInput('primaries-required'),
+      config,
+      only: core.getInput('pools'),
+    }),
+    fallbackOnError: core.getBooleanInput('fallback-on-error'),
+    fallbackOnForkPr: core.getBooleanInput('fallback-on-fork-pr'),
+    platformCheck,
+    claim: core.getBooleanInput('claim'),
+    claimTtlMs: claimTtlMinutes * 60 * 1000,
   };
+}
 
-  const response = await http.getJson(
-    `https://api.github.com/${apiPath}`,
-    headers
-  );
+function client({ token, organization, enterprise }) {
+  if (!token) {
+    throw new Error('github-token is empty. Pass a GitHub App installation token (see README, "Token").');
+  }
+  return new RunnerClient({
+    token,
+    apiPath: apiPathFor({ repository: process.env.GITHUB_REPOSITORY, organization, enterprise }),
+    baseUrl: process.env.GITHUB_API_URL || 'https://api.github.com',
+  });
+}
 
-  if (response.statusCode !== 200) {
-    return {
-      error: `Failed to get runners. Status code: ${response.statusCode}`,
-    };
+function writeOutputs(results) {
+  const names = Object.keys(results);
+  const runners = {};
+  for (const name of names) runners[name] = results[name].labels;
+
+  // runs-on takes a JSON array, read with fromJson(...)
+  core.setOutput('runners', JSON.stringify(runners));
+  core.setOutput('details', JSON.stringify(results));
+  core.setOutput('claims', names.map((name) => results[name].claim).filter(Boolean).join(','));
+
+  if (names.length === 1) {
+    const result = results[names[0]];
+    core.setOutput('use-runner', JSON.stringify(result.labels));
+    core.setOutput('is-primary', String(result.isPrimary));
+    core.setOutput('runner-name', result.runnerName);
+    core.setOutput('reason', result.reason);
   }
 
-  const runners = response.result.runners || [];
-  let useRunner = fallbackRunner;
-  let primaryIsOnline = false;
-  let sufficientPrimaries = false;
-  let primariesAvailableCount = 0;
+  for (const name of names) {
+    const result = results[name];
+    core.info(`${name}: ${JSON.stringify(result.labels)} (${result.reason})`);
+  }
+}
 
-  for (const runner of runners) {
-    if (runner.status === "online") {
-      const runnerLabels = runner.labels.map((label) => label.name);
-      if (primaryRunnerLabels.every((label) => runnerLabels.includes(label))) {
-        primaryIsOnline = true;
+async function writeSummary(results) {
+  const rows = Object.entries(results).map(([name, result]) => [
+    name,
+    result.labels.join(', '),
+    result.isPrimary ? 'primary' : 'fallback',
+    result.reason,
+  ]);
+  await core.summary
+    .addHeading('Runner routing', 3)
+    .addTable([
+      [{ data: 'Pool', header: true }, { data: 'Runs on', header: true }, { data: 'Type', header: true }, { data: 'Why', header: true }],
+      ...rows,
+    ])
+    .write();
+}
 
-        // Is the number of primaries important? If so, keep track of them
-        if (primariesRequired !== undefined) {
-          // if we need more primaries and this one is busy, keep looking
-          if (runner.busy === true) {
-           continue;
-          }
+async function release(claimsText) {
+  const claims = parseClaims(claimsText);
+  const runnerClient = client({
+    token: core.getInput('github-token'),
+    organization: core.getInput('organization'),
+    enterprise: core.getInput('enterprise'),
+  });
+  for (const { runnerId, label } of claims) {
+    try {
+      await runnerClient.removeLabel(runnerId, label);
+      core.info(`Released claim ${label} on runner ${runnerId}`);
+    } catch (error) {
+      // An unreleased claim only expires later, so never fail the job over it
+      core.warning(`Could not release claim ${label} on runner ${runnerId}: ${error.message}`);
+    }
+  }
+}
 
-          // if we still do not have enough primaries, keep looking
-          primariesAvailableCount++;
-          if (primariesAvailableCount < primariesRequired) {
-            continue;
-          }
-        }
+async function route() {
+  let inputs;
+  try {
+    inputs = readInputs();
+  } catch (error) {
+    core.setFailed(error.message);
+    return;
+  }
 
-        sufficientPrimaries = true;
-        useRunner = primaryRunnerLabels.join(",");
-        break;
+  let results;
+  if (inputs.fallbackOnForkPr && isForkPullRequest({
+    eventName: process.env.GITHUB_EVENT_NAME,
+    eventPath: process.env.GITHUB_EVENT_PATH,
+    repository: process.env.GITHUB_REPOSITORY,
+  })) {
+    results = fallbackResults(inputs.pools, 'pull request from a fork always uses the fallback');
+  } else {
+    try {
+      results = await routePools({
+        pools: inputs.pools,
+        client: client(inputs),
+        claim: inputs.claim,
+        claimTtlMs: inputs.claimTtlMs,
+        platformCheck: inputs.platformCheck,
+        runId: process.env.GITHUB_RUN_ID,
+        attempt: process.env.GITHUB_RUN_ATTEMPT,
+        log: (message) => core.info(message),
+        warn: (message) => core.warning(message),
+      });
+    } catch (error) {
+      if (error instanceof ConfigError || !inputs.fallbackOnError) {
+        core.setFailed(error.message);
+        return;
       }
+      core.warning('Checking for available runners failed, but fallback-on-error is true');
+      core.warning(`Original error: ${error.message}`);
+      results = fallbackResults(inputs.pools, `error while checking runners: ${error.message}`);
     }
   }
 
-  // return a JSON string so that it can be parsed using `fromJson`, e.g. fromJson('["self-hosted", "linux"]')
-  return { useRunner: JSON.stringify(useRunner.split(",")), primaryIsOnline, sufficientPrimaries };
+  writeOutputs(results);
+  try {
+    await writeSummary(results);
+  } catch (error) {
+    core.warning(`Could not write job summary: ${error.message}`);
+  }
 }
 
 async function main() {
-  const githubRepository = process.env.GITHUB_REPOSITORY;
-  const organization = core.getInput('organization', { required: false });
-  const enterprise = core.getInput('enterprise', { required: false });
-  const [owner, repo] = githubRepository.split("/");
-  if (organization && enterprise) {
-    throw new Error('You cannot specify both organization and enterprise inputs. Please choose one.');
-  }
-  let apiPath = `repos/${owner}/${repo}/actions/runners`;
-  if (organization) {
-    apiPath = `orgs/${organization}/actions/runners`;
-  } else if (enterprise) {
-    apiPath = `enterprises/${enterprise}/actions/runners`;
-  }
-
-  const fallbackOnError = core.getBooleanInput('fallback-on-error', { required: false });
-  let fallbackRunner;
-
-  try {
-    fallbackRunner = core.getInput('fallback-runner', { required: true });
-
-    const inputs = {
-      apiPath,
-      token: core.getInput('github-token', { required: true }),
-      primaryRunnerLabels: core.getInput('primary-runner', { required: true }).split(','),
-      fallbackRunner,
-      primariesRequired: core.getInput('primaries-required', { required: false }),
-    };
-
-    const { useRunner, primaryIsOnline, sufficientPrimaries, error } = await checkRunner(inputs);
-
-    if (error) {
-      if (fallbackOnError !== true) {
-        core.setFailed(error);
-        return;
-      } else {
-        core.warning('Checking for available runners failed, but fallback-on-error is true');
-        core.warning(`Original error: ${error}`);
-        core.warning(`using runner: ${fallbackRunner}`);
-        core.summary.addRaw(`Selected runner ${fallbackRunner}. Check log for details.`);
-        core.summary.write();
-        core.setOutput('use-runner', [fallbackRunner] );
-        return;
-      }
+  const claimsToRelease = core.getInput('release');
+  if (claimsToRelease) {
+    try {
+      await release(claimsToRelease);
+    } catch (error) {
+      core.warning(`Could not release claims: ${error.message}`);
     }
-
-    core.info(`Primary runner is online: ${primaryIsOnline}`);
-    core.info(`Sufficient primary runners available: ${sufficientPrimaries}`);
-    core.info(`Using runner: ${useRunner}`);
-    core.summary.addRaw(`Selected runner ${useRunner}. Check log for details.`);
-    core.summary.write();
-    core.setOutput('use-runner', useRunner);
-  } catch (error) {
-    if (fallbackRunner === undefined || fallbackOnError !== true) {
-      core.setFailed(error);
-    } else {
-      core.warning('Checking for available runners failed, but fallback-on-error is true');
-      core.warning(`Original error: ${error}`);
-      core.warning(`using runner: ${fallbackRunner}`);
-      core.summary.addRaw(`Selected runner ${fallbackRunner}. Check log for details.`);
-      core.summary.write();
-      core.setOutput('use-runner', [fallbackRunner]);
-    }
+    return;
   }
+  await route();
 }
 
-module.exports = { checkRunner };
+module.exports = { main };
 
 if (require.main === require.cache[eval('__filename')]) {
   main();
@@ -26614,6 +26652,632 @@ webidl.converters.WebSocketSendData = function (V) {
 module.exports = {
   WebSocket
 }
+
+
+/***/ }),
+
+/***/ 1283:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+const { ConfigError, parseLabels, parseCount } = __nccwpck_require__(1904);
+
+const DEFAULT_POOL = 'default';
+
+// Shared rules, usually stored as JSON in an org variable such as vars.ROUTACT_CONFIG:
+// {
+//   "organization": "my-org",
+//   "pools": {
+//     "linux-arm": { "primary": "self-hosted,Linux,ARM64", "fallback": "ubuntu-24.04-arm", "primaries-required": 1 }
+//   }
+// }
+// A bare object of pools (without the "pools" key) is accepted too.
+function parseConfig(text) {
+  if (!text || !String(text).trim()) return undefined;
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    throw new ConfigError(`config is not valid JSON: ${error.message}`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new ConfigError('config must be a JSON object');
+  }
+
+  const poolsObject = parsed.pools || omit(parsed, ['organization', 'enterprise']);
+  const pools = Object.entries(poolsObject).map(([name, value]) => parsePool(name, value));
+  if (pools.length === 0) {
+    throw new ConfigError('config does not define any pools');
+  }
+  return {
+    organization: parsed.organization,
+    enterprise: parsed.enterprise,
+    pools,
+  };
+}
+
+function parsePool(name, value) {
+  if (!value || typeof value !== 'object') {
+    throw new ConfigError(`Pool "${name}" must be an object with "primary" and "fallback"`);
+  }
+  const pool = {
+    name,
+    primary: parseLabels(value.primary),
+    fallback: parseLabels(value.fallback),
+    primariesRequired: parseCount(value['primaries-required'], `Pool "${name}" primaries-required`),
+  };
+  if (pool.primary.length === 0) throw new ConfigError(`Pool "${name}" has no primary labels`);
+  if (pool.fallback.length === 0) throw new ConfigError(`Pool "${name}" has no fallback labels`);
+  return pool;
+}
+
+function omit(object, keys) {
+  return Object.fromEntries(Object.entries(object).filter(([key]) => !keys.includes(key)));
+}
+
+// Pools from the single-pool inputs (primary-runner / fallback-runner) or from config.
+// `only` limits config pools to the named ones.
+function resolvePools({ primaryRunner, fallbackRunner, primariesRequired, config, only }) {
+  if (primaryRunner || fallbackRunner) {
+    if (!primaryRunner || !fallbackRunner) {
+      throw new ConfigError('primary-runner and fallback-runner must be set together');
+    }
+    return [{
+      name: DEFAULT_POOL,
+      primary: parseLabels(primaryRunner),
+      fallback: parseLabels(fallbackRunner),
+      primariesRequired: parseCount(primariesRequired),
+    }];
+  }
+  if (!config) {
+    throw new ConfigError('Set either primary-runner and fallback-runner, or config');
+  }
+  const wanted = parseLabels(only);
+  if (wanted.length === 0) return config.pools;
+  return wanted.map((name) => {
+    const pool = config.pools.find((candidate) => candidate.name === name);
+    if (!pool) {
+      const known = config.pools.map((candidate) => candidate.name).join(', ');
+      throw new ConfigError(`Pool "${name}" is not in config (known pools: ${known})`);
+    }
+    return pool;
+  });
+}
+
+module.exports = { DEFAULT_POOL, parseConfig, resolvePools };
+
+
+/***/ }),
+
+/***/ 4281:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+const fs = __nccwpck_require__(9896);
+
+const PR_EVENTS = [
+  'pull_request',
+  'pull_request_target',
+  'pull_request_review',
+  'pull_request_review_comment',
+];
+
+// True when the run was triggered by a pull request from a fork. Those runs
+// get no secrets, and running untrusted code on self-hosted runners is unsafe,
+// so they always go to the fallback.
+function isForkPullRequest({ eventName, eventPath, repository }) {
+  if (!PR_EVENTS.includes(eventName) || !eventPath) return false;
+  let payload;
+  try {
+    payload = JSON.parse(fs.readFileSync(eventPath, 'utf8'));
+  } catch {
+    return false;
+  }
+  const pullRequest = payload.pull_request;
+  if (!pullRequest) return false;
+  const head = pullRequest.head && pullRequest.head.repo;
+  // A deleted fork leaves head.repo null; treat it as a fork
+  if (!head) return true;
+  // head.repo.fork is not used: it is also true for same-repo PRs when the base repo is itself a fork
+  return head.full_name.toLowerCase() !== String(repository).toLowerCase();
+}
+
+module.exports = { isForkPullRequest };
+
+
+/***/ }),
+
+/***/ 6474:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+const httpClient = __nccwpck_require__(4844);
+
+const API_VERSION = '2022-11-28';
+const PAGE_SIZE = 100;
+
+// Thin client for the self-hosted runner endpoints. apiPath is one of
+// repos/{owner}/{repo}/actions/runners, orgs/{org}/actions/runners or
+// enterprises/{enterprise}/actions/runners.
+class RunnerClient {
+  constructor({ token, apiPath, baseUrl = 'https://api.github.com', http }) {
+    this.apiPath = apiPath;
+    this.baseUrl = baseUrl.replace(/\/$/, '');
+    this.http = http || new httpClient.HttpClient('routact', [], {
+      allowRetries: true,
+      maxRetries: 3,
+      socketTimeout: 15000,
+    });
+    this.headers = {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': API_VERSION,
+    };
+  }
+
+  url(path = '') {
+    return `${this.baseUrl}/${this.apiPath}${path}`;
+  }
+
+  // getJson/postJson reject on most non-2xx codes and resolve on 404; send
+  // both through assertOk so every failure carries the same hint
+  async request(action, fn) {
+    let response;
+    try {
+      response = await fn();
+    } catch (error) {
+      response = { statusCode: error.statusCode, error };
+    }
+    assertOk(response, action);
+    return response;
+  }
+
+  async listRunners() {
+    const runners = [];
+    for (let page = 1; ; page++) {
+      const response = await this.request('list runners',
+        () => this.http.getJson(this.url(`?per_page=${PAGE_SIZE}&page=${page}`), this.headers));
+      const batch = (response.result && response.result.runners) || [];
+      runners.push(...batch);
+      const total = response.result && response.result.total_count;
+      if (batch.length < PAGE_SIZE || (total !== undefined && runners.length >= total)) {
+        return runners;
+      }
+    }
+  }
+
+  async getRunner(id) {
+    const response = await this.request(`get runner ${id}`,
+      () => this.http.getJson(this.url(`/${id}`), this.headers));
+    return response.result;
+  }
+
+  async addLabel(id, label) {
+    await this.request(`add label to runner ${id}`,
+      () => this.http.postJson(this.url(`/${id}/labels`), { labels: [label] }, this.headers));
+  }
+
+  async removeLabel(id, label) {
+    const response = await this.http.del(this.url(`/${id}/labels/${encodeURIComponent(label)}`), this.headers);
+    const statusCode = response.message.statusCode;
+    await response.readBody();
+    // 404 means the label is already gone, which is the outcome we wanted
+    if (statusCode !== 200 && statusCode !== 404) {
+      throw new Error(`Failed to remove label from runner ${id}. Status code: ${statusCode}`);
+    }
+  }
+}
+
+function assertOk(response, action) {
+  if (response.statusCode !== 200 && response.statusCode !== 201) {
+    const hint = response.statusCode === 401 || response.statusCode === 403 || response.statusCode === 404
+      ? ' Check that the token can access self-hosted runners for this scope (see README, "Token").'
+      : '';
+    const detail = response.error ? ` ${response.error.message}` : '';
+    throw new Error(`Failed to ${action}. Status code: ${response.statusCode}.${detail}${hint}`);
+  }
+}
+
+function apiPathFor({ repository, organization, enterprise }) {
+  if (organization && enterprise) {
+    throw new Error('You cannot specify both organization and enterprise inputs. Please choose one.');
+  }
+  if (organization) return `orgs/${organization}/actions/runners`;
+  if (enterprise) return `enterprises/${enterprise}/actions/runners`;
+  return `repos/${repository}/actions/runners`;
+}
+
+module.exports = { RunnerClient, apiPathFor };
+
+
+/***/ }),
+
+/***/ 1274:
+/***/ ((module) => {
+
+// Works out the OS and CPU architecture behind a set of runner labels, so a
+// fallback is only ever chosen when it matches the primary's platform.
+
+const OS_NAMES = {
+  linux: 'Linux',
+  macos: 'macOS',
+  windows: 'Windows',
+};
+
+const ARCH_NAMES = {
+  x64: 'X64',
+  arm64: 'ARM64',
+  arm: 'ARM',
+};
+
+function normalize(labels) {
+  return labels.map((label) => String(label).trim().toLowerCase()).filter(Boolean);
+}
+
+// GitHub-hosted labels, and common third-party ones (e.g. Blacksmith), encode
+// the platform in the label name. Returns {os, arch}; either may be undefined.
+function inferFromLabels(labels) {
+  const names = normalize(labels);
+  let os;
+  let arch;
+
+  for (const name of names) {
+    // Exact runner default labels win over name heuristics
+    if (OS_NAMES[name]) os = OS_NAMES[name];
+    if (ARCH_NAMES[name]) arch = ARCH_NAMES[name];
+  }
+
+  for (const name of names) {
+    if (!os) {
+      if (/ubuntu|linux|debian|fedora|alpine/.test(name)) os = 'Linux';
+      else if (/macos|osx|darwin/.test(name)) os = 'macOS';
+      else if (/windows|win\d/.test(name)) os = 'Windows';
+    }
+    if (!arch) {
+      if (/arm64|aarch64|-arm\b|arm$/.test(name)) arch = 'ARM64';
+      else if (/x64|amd64|x86_64|intel/.test(name)) arch = 'X64';
+    }
+  }
+
+  if (os && !arch) {
+    arch = defaultArch(os, names);
+  }
+
+  return { os, arch };
+}
+
+// Hosted images without an arch in the name have a known default
+function defaultArch(os, names) {
+  if (os === 'macOS') {
+    // macos-13 and the -large sizes are Intel, everything newer is Apple silicon
+    if (names.some((name) => /^macos-13\b|-large$/.test(name))) return 'X64';
+    if (names.some((name) => /^macos-/.test(name))) return 'ARM64';
+    return undefined;
+  }
+  if (names.some((name) => /^(ubuntu|windows)-/.test(name))) return 'X64';
+  return undefined;
+}
+
+// A registered runner reports its OS directly; the arch comes from its default labels
+function fromRunner(runner) {
+  const labels = (runner.labels || []).map((label) => label.name);
+  const inferred = inferFromLabels(labels);
+  return {
+    os: runner.os || inferred.os,
+    arch: inferred.arch,
+  };
+}
+
+function describe(platform) {
+  return `${platform.os || 'unknown OS'}/${platform.arch || 'unknown arch'}`;
+}
+
+// Returns a mismatch description, or undefined when the platforms agree or
+// there is not enough information to tell
+function mismatch(primary, fallback) {
+  const problems = [];
+  if (primary.os && fallback.os && primary.os !== fallback.os) problems.push('OS');
+  if (primary.arch && fallback.arch && primary.arch !== fallback.arch) problems.push('architecture');
+  if (problems.length === 0) return undefined;
+  return `${problems.join(' and ')} differ: primary is ${describe(primary)}, fallback is ${describe(fallback)}`;
+}
+
+function isKnown(platform) {
+  return Boolean(platform.os && platform.arch);
+}
+
+module.exports = { inferFromLabels, fromRunner, mismatch, describe, isKnown };
+
+
+/***/ }),
+
+/***/ 1904:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+const platform = __nccwpck_require__(1274);
+
+const CLAIM_PREFIX = 'routact-claim-';
+
+// Errors in the routing setup itself. These fail the job even with
+// fallback-on-error, because falling back would hide a broken configuration.
+class ConfigError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ConfigError';
+  }
+}
+
+function parseLabels(value) {
+  const list = Array.isArray(value) ? value : String(value || '').split(',');
+  return list.map((label) => String(label).trim()).filter(Boolean);
+}
+
+// Empty means "not set": only online-ness matters, busy runners still count
+function parseCount(value, name = 'primaries-required') {
+  if (value === undefined || value === null || value === '') return undefined;
+  const count = Number(value);
+  if (!Number.isInteger(count) || count < 1) {
+    throw new ConfigError(`${name} must be a whole number of at least 1, got "${value}"`);
+  }
+  return count;
+}
+
+function runnerLabels(runner) {
+  return (runner.labels || []).map((label) => label.name.toLowerCase());
+}
+
+// GitHub matches runs-on labels case-insensitively, so we do too
+function hasLabels(runner, wanted) {
+  const labels = runnerLabels(runner);
+  return wanted.every((label) => labels.includes(label.toLowerCase()));
+}
+
+function claimLabel({ now, runId, attempt, random = Math.random }) {
+  const suffix = random().toString(36).slice(2, 8);
+  return `${CLAIM_PREFIX}${Math.floor(now / 1000)}-${runId || 'local'}-${attempt || 1}-${suffix}`;
+}
+
+function claimTime(label) {
+  const match = new RegExp(`^${CLAIM_PREFIX}(\\d+)-`).exec(label);
+  return match ? Number(match[1]) * 1000 : undefined;
+}
+
+function claims(runner) {
+  return runnerLabels(runner).filter((label) => label.startsWith(CLAIM_PREFIX));
+}
+
+function liveClaims(runner, now, ttlMs) {
+  return claims(runner).filter((label) => {
+    const time = claimTime(label);
+    return time !== undefined && now - time < ttlMs;
+  });
+}
+
+function staleClaims(runner, now, ttlMs) {
+  const live = liveClaims(runner, now, ttlMs);
+  return claims(runner).filter((label) => !live.includes(label));
+}
+
+// Platform of the primary: from a registered runner if any match, else from its labels
+function primaryPlatform(pool, runners) {
+  const registered = runners.find((runner) => hasLabels(runner, pool.primary));
+  return registered ? platform.fromRunner(registered) : platform.inferFromLabels(pool.primary);
+}
+
+// The fallback can itself be a self-hosted label set, so prefer a registered runner
+function fallbackPlatform(pool, runners) {
+  const registered = runners.find((runner) => hasLabels(runner, pool.fallback));
+  return registered ? platform.fromRunner(registered) : platform.inferFromLabels(pool.fallback);
+}
+
+// Returns a list of warnings; throws ConfigError when the policy is "error"
+function checkPlatform(pool, runners, policy) {
+  if (policy === 'off') return [];
+  const primary = primaryPlatform(pool, runners);
+  const fallback = fallbackPlatform(pool, runners);
+  const problem = platform.mismatch(primary, fallback);
+  if (problem) {
+    const message = `Pool "${pool.name}": fallback runner does not match the primary platform (${problem}).`;
+    if (policy === 'error') {
+      throw new ConfigError(`${message} Pick a fallback with the same OS and architecture, or set platform-check to "warn" or "off".`);
+    }
+    return [message];
+  }
+  if (!platform.isKnown(primary) || !platform.isKnown(fallback)) {
+    return [`Pool "${pool.name}": could not fully determine the platform (primary ${platform.describe(primary)}, fallback ${platform.describe(fallback)}), so the platform check is incomplete. Add OS and architecture labels such as Linux,X64 to make it exact.`];
+  }
+  return [];
+}
+
+// Pure decision for one pool given the current runner list
+function decide(pool, runners, { claim = false, now = Date.now(), claimTtlMs } = {}) {
+  const matching = runners.filter((runner) => runner.status === 'online' && hasLabels(runner, pool.primary));
+  const idle = matching.filter((runner) => runner.busy !== true
+    && (!claim || liveClaims(runner, now, claimTtlMs).length === 0));
+  // Claiming always needs at least one idle runner to claim
+  const required = pool.primariesRequired !== undefined ? pool.primariesRequired : (claim ? 1 : undefined);
+
+  if (matching.length === 0) {
+    return { usePrimary: false, matching, idle, reason: 'no matching primary runner is online' };
+  }
+  if (required !== undefined && idle.length < required) {
+    return {
+      usePrimary: false,
+      matching,
+      idle,
+      reason: `${idle.length} of ${matching.length} online primary runners are idle, ${required} required`,
+    };
+  }
+  const reason = required === undefined
+    ? `${matching.length} primary runners online`
+    : `${idle.length} of ${matching.length} online primary runners are idle, ${required} required`;
+  return { usePrimary: true, matching, idle, reason };
+}
+
+function shuffle(list, random = Math.random) {
+  const copy = [...list];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
+}
+
+// Labels one idle runner with a claim that only this run holds. A claim wins
+// only when it is the sole live claim on the runner after it was written, so
+// two routers racing for the same runner can both lose (and try the next one)
+// but can never both win.
+async function claimRunner({ client, candidates, label, now, claimTtlMs, random, log = () => {} }) {
+  for (const candidate of shuffle(candidates, random)) {
+    await client.addLabel(candidate.id, label);
+    let fresh;
+    try {
+      fresh = await client.getRunner(candidate.id);
+    } catch (error) {
+      log(`Could not re-read runner ${candidate.name} after claiming it: ${error.message}`);
+      await releaseQuietly(client, candidate.id, label, log);
+      continue;
+    }
+    const live = liveClaims(fresh, now, claimTtlMs);
+    const ours = live.includes(label.toLowerCase());
+    if (ours && live.length === 1 && fresh.status === 'online' && fresh.busy !== true) {
+      return fresh;
+    }
+    log(`Runner ${candidate.name} was taken by another run, trying the next one`);
+    await releaseQuietly(client, candidate.id, label, log);
+  }
+  return undefined;
+}
+
+async function releaseQuietly(client, runnerId, label, log) {
+  try {
+    await client.removeLabel(runnerId, label);
+  } catch (error) {
+    log(`Could not remove claim ${label} from runner ${runnerId}: ${error.message}`);
+  }
+}
+
+// Expired claims are left behind when a job never ran its release step
+async function removeStaleClaims({ client, runners, now, claimTtlMs, log = () => {} }) {
+  for (const runner of runners) {
+    for (const label of staleClaims(runner, now, claimTtlMs)) {
+      log(`Removing expired claim ${label} from runner ${runner.name}`);
+      await releaseQuietly(client, runner.id, label, log);
+    }
+  }
+}
+
+function formatClaim(runnerId, label) {
+  return `${runnerId}:${label}`;
+}
+
+function parseClaims(value) {
+  return String(value || '')
+    .split(/[\s,]+/)
+    .filter(Boolean)
+    .map((entry) => {
+      const index = entry.indexOf(':');
+      const runnerId = Number(entry.slice(0, index));
+      const label = entry.slice(index + 1);
+      if (index < 1 || !Number.isInteger(runnerId) || !label.startsWith(CLAIM_PREFIX)) {
+        throw new ConfigError(`Invalid claim "${entry}", expected <runner-id>:${CLAIM_PREFIX}...`);
+      }
+      return { runnerId, label };
+    });
+}
+
+// Routes every pool against one runner list. Returns {pool name: result}.
+async function routePools({
+  pools,
+  client,
+  claim = false,
+  claimTtlMs = 10 * 60 * 1000,
+  platformCheck = 'error',
+  runId,
+  attempt,
+  now = Date.now(),
+  random = Math.random,
+  log = () => {},
+  warn = () => {},
+}) {
+  let runners;
+  try {
+    runners = await client.listRunners();
+  } catch (error) {
+    // Still catch a cross-platform fallback from the labels alone, so a broken
+    // config is not hidden behind fallback-on-error
+    for (const pool of pools) checkPlatform(pool, [], platformCheck);
+    throw error;
+  }
+
+  for (const pool of pools) {
+    checkPlatform(pool, runners, platformCheck).forEach((message) => warn(message));
+  }
+
+  if (claim) {
+    await removeStaleClaims({ client, runners, now, claimTtlMs, log });
+  }
+
+  const results = {};
+  const claimedIds = new Set();
+  for (const pool of pools) {
+    const available = runners.filter((runner) => !claimedIds.has(runner.id));
+    const decision = decide(pool, available, { claim, now, claimTtlMs });
+    const result = {
+      labels: decision.usePrimary ? pool.primary : pool.fallback,
+      isPrimary: decision.usePrimary,
+      runnerName: '',
+      claim: '',
+      reason: decision.reason,
+    };
+
+    if (decision.usePrimary && claim) {
+      const label = claimLabel({ now, runId, attempt, random });
+      const won = await claimRunner({ client, candidates: decision.idle, label, now, claimTtlMs, random, log });
+      if (won) {
+        claimedIds.add(won.id);
+        result.labels = [label];
+        result.runnerName = won.name;
+        result.claim = formatClaim(won.id, label);
+        result.reason = `${decision.reason}; claimed runner ${won.name}`;
+      } else {
+        result.labels = pool.fallback;
+        result.isPrimary = false;
+        result.reason = `${decision.reason}, but every idle runner was claimed by another run first`;
+      }
+    } else if (decision.usePrimary && decision.matching.length === 1) {
+      result.runnerName = decision.matching[0].name;
+    }
+
+    results[pool.name] = result;
+  }
+  return results;
+}
+
+function fallbackResults(pools, reason) {
+  const results = {};
+  for (const pool of pools) {
+    results[pool.name] = { labels: pool.fallback, isPrimary: false, runnerName: '', claim: '', reason };
+  }
+  return results;
+}
+
+module.exports = {
+  CLAIM_PREFIX,
+  ConfigError,
+  parseLabels,
+  parseCount,
+  hasLabels,
+  claimLabel,
+  claimTime,
+  liveClaims,
+  staleClaims,
+  checkPlatform,
+  decide,
+  claimRunner,
+  removeStaleClaims,
+  formatClaim,
+  parseClaims,
+  routePools,
+  fallbackResults,
+};
 
 
 /***/ }),

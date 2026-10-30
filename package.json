@@ -1,7 +1,7 @@
 {
-  "name": "runner-fallback-action",
-  "version": "1.0.2",
-  "description": "Github Runner Fallback Action",
+  "name": "routact",
+  "version": "2.0.0",
+  "description": "Route GitHub Actions jobs to idle self-hosted runners, with a same-platform fallback",
   "main": "index.js",
   "scripts": {
     "lint": "eslint .",
@@ -11,15 +11,20 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mikehardy/runner-fallback-action.git"
+    "url": "git+https://github.com/SolZeroAI/routact.git"
   },
   "keywords": [
     "GitHub",
     "Actions",
     "Runner"
   ],
-  "author": "Mike Hardy <github@mikehardy.net> (https://github.com/mikehardy)",
+  "author": "SolZeroAI",
   "contributors": [
+    {
+      "name": "Mike Hardy",
+      "email": "github@mikehardy.net",
+      "url": "https://github.com/mikehardy"
+    },
     {
       "name": "Jimmy Chen",
       "email": "jchen.tc@gmail.com",
@@ -28,9 +33,9 @@
   ],
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/mikehardy/runner-fallback-action/issues"
+    "url": "https://github.com/SolZeroAI/routact/issues"
   },
-  "homepage": "https://github.com/mikehardy/runner-fallback-action#readme",
+  "homepage": "https://github.com/SolZeroAI/routact#readme",
   "dependencies": {
     "@actions/core": "^1.11.1",
     "@actions/http-client": "^3.0.0"
@@ -43,5 +48,13 @@
     "globals": "^16.5.0",
     "jest": "^30.2.0"
   },
-  "packageManager": "yarn@4.10.3+sha512.c38cafb5c7bb273f3926d04e55e1d8c9dfa7d9c3ea1f36a4868fa028b9e5f72298f0b7f401ad5eb921749eb012eb1c3bb74bf7503df3ee43fd600d14a018266f"
+  "packageManager": "yarn@4.10.3+sha512.c38cafb5c7bb273f3926d04e55e1d8c9dfa7d9c3ea1f36a4868fa028b9e5f72298f0b7f401ad5eb921749eb012eb1c3bb74bf7503df3ee43fd600d14a018266f",
+  "jest": {
+    "testMatch": [
+      "**/__tests__/**/*.test.js"
+    ]
+  },
+  "engines": {
+    "node": ">=24"
+  }
 }

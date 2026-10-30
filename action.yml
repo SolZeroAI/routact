@@ -1,35 +1,72 @@
-name: 'Runner Availability Checker'
-description: 'Check for availability of self-hosted GitHub runners and fallback to GitHub-hosted runners if needed'
-author: '@jimmygchen'
+name: 'Routact'
+description: 'Route jobs to idle self-hosted runners, falling back to a runner of the same platform when none are free'
+author: 'SolZeroAI'
 branding:
-  icon: activity
+  icon: shuffle
   color: blue
 inputs:
   github-token:
-    description: 'GitHub token with repo and actions scope for querying runner information'
-    required: true
-  primary-runner:
-    description: 'Comma-separated list of labels for the primary runner, e.g. self-hosted,linux'
-    required: true
-  fallback-runner:
-    description: 'Name or labels of the fallback runner, e.g. ubuntu-latest'
-    required: true
-  organization:
-    description: "GitHub organization name to check for self-hosted runners (mutually exclusive with enterprise), if not supplied we will use user's personal runners"
+    description: 'Token that can read self-hosted runners for the chosen scope. A GitHub App installation token is recommended (see README). Not needed for fork pull requests, which always fall back.'
     required: false
-  enterprise:
-    description: "GitHub enterprise name to check for self-hosted runners (mutually exclusive with organization), if not supplied we will use user's personal runners"
+  primary-runner:
+    description: 'Comma-separated labels for the primary runner, e.g. self-hosted,Linux,X64. Use with fallback-runner, or use config instead.'
+    required: false
+  fallback-runner:
+    description: 'Comma-separated labels for the fallback runner, e.g. ubuntu-24.04'
     required: false
   primaries-required:
-    description: 'Use the fallback runner if there are not at least this many primaries that are not busy'
+    description: 'Fall back unless at least this many matching primaries are online and idle. When empty, any online primary is enough, busy or not.'
+    required: false
+  config:
+    description: 'JSON routing rules with several named pools, usually from an org variable: config: ${{ vars.ROUTACT_CONFIG }}. See README.'
+    required: false
+  pools:
+    description: 'Comma-separated pool names from config to route. Default is every pool.'
+    required: false
+  organization:
+    description: 'Organization whose runners to check (mutually exclusive with enterprise). Default is the repository runners.'
+    required: false
+  enterprise:
+    description: 'Enterprise whose runners to check (mutually exclusive with organization)'
     required: false
   fallback-on-error:
-    description: 'Use the fallback runner if the action has any type of error, for example missing or non-functional github-token'
+    description: 'Use the fallback if checking runners fails, for example on an expired token or a GitHub API outage. Configuration errors still fail.'
     required: false
-    default: false
+    default: 'false'
+  fallback-on-fork-pr:
+    description: 'Always use the fallback for pull requests from forks, without calling the API'
+    required: false
+    default: 'true'
+  platform-check:
+    description: 'What to do when a fallback does not match the primary OS and CPU architecture: error, warn or off'
+    required: false
+    default: 'error'
+  claim:
+    description: 'Claim a specific idle runner with a unique label so concurrent runs never pick the same one. Needs write access to self-hosted runners. See README.'
+    required: false
+    default: 'false'
+  claim-ttl-minutes:
+    description: 'Minutes after which an unreleased claim expires and is removed'
+    required: false
+    default: '10'
+  release:
+    description: 'Release claims instead of routing: pass the claims output of the routing step'
+    required: false
 outputs:
   use-runner:
-    description: 'The runner to use, either the primary or the fallback runner, based on availability'
+    description: 'JSON label array for runs-on, read with fromJson. Set when exactly one pool is routed.'
+  is-primary:
+    description: '"true" when the primary was chosen. Set when exactly one pool is routed.'
+  runner-name:
+    description: 'Name of the chosen runner, when known (always known with claim). Set when exactly one pool is routed.'
+  reason:
+    description: 'Why this runner was chosen. Set when exactly one pool is routed.'
+  runners:
+    description: 'JSON object of pool name to label array, e.g. fromJson(needs.route.outputs.runners)[''linux-arm'']. Single-pool inputs use the pool name "default".'
+  details:
+    description: 'JSON object of pool name to {labels, isPrimary, runnerName, claim, reason}'
+  claims:
+    description: 'Comma-separated claims made by this run, to pass to release'
 runs:
-  using: 'node20'
+  using: 'node24'
   main: 'dist/index.js'
