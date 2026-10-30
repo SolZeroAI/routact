@@ -55443,10 +55443,9 @@ function defaultArch(os, names) {
 function fromRunner(runner) {
   const labels = (runner.labels || []).map((label) => label.name);
   const inferred = inferFromLabels(labels);
-  return {
-    os: runner.os || inferred.os,
-    arch: inferred.arch,
-  };
+  // The API reports the OS in any case (kinhin runners report "linux")
+  const os = runner.os ? OS_NAMES[String(runner.os).toLowerCase()] || runner.os : inferred.os;
+  return { os, arch: inferred.arch };
 }
 
 function describe(platform) {

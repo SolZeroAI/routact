@@ -32,6 +32,13 @@ describe('fromRunner', () => {
     const runner = { os: 'macOS', labels: [{ name: 'self-hosted' }, { name: 'ARM64' }, { name: 'mac-mini' }] };
     expect(fromRunner(runner)).toEqual({ os: 'macOS', arch: 'ARM64' });
   });
+
+  it('normalizes the case of the reported os', () => {
+    const linux = { os: 'linux', labels: [{ name: 'self-hosted' }, { name: 'arm64' }, { name: 'linux' }] };
+    expect(fromRunner(linux)).toEqual({ os: 'Linux', arch: 'ARM64' });
+    const mac = { os: 'macos', labels: [{ name: 'self-hosted' }, { name: 'arm64' }] };
+    expect(fromRunner(mac)).toEqual({ os: 'macOS', arch: 'ARM64' });
+  });
 });
 
 describe('mismatch', () => {
