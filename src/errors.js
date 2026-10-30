@@ -2,9 +2,9 @@
 // fallback-on-error, because falling back would hide a broken configuration.
 class ConfigError extends Error {
   constructor(message) {
-    super(message);
-    this.name = 'ConfigError';
+    super(message)
+    this.name = "ConfigError"
   }
 }
 
-module.exports = { ConfigError };
+module.exports = { ConfigError }

@@ -1,23 +1,18 @@
 {
   "name": "routact",
-  "version": "2.0.0",
+  "version": "1.0.2",
+  "private": true,
   "description": "Route GitHub Actions jobs to idle self-hosted runners, with a same-platform fallback",
-  "main": "index.js",
-  "scripts": {
-    "lint": "eslint .",
-    "prepare": "ncc build index.js -o dist --source-map --license licenses.txt",
-    "test": "jest",
-    "all": "npm run lint && npm run prepare && npm run test"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/SolZeroAI/routact.git"
-  },
   "keywords": [
-    "GitHub",
     "Actions",
+    "GitHub",
     "Runner"
   ],
+  "homepage": "https://github.com/SolZeroAI/routact#readme",
+  "bugs": {
+    "url": "https://github.com/SolZeroAI/routact/issues"
+  },
+  "license": "MIT",
   "author": "SolZeroAI",
   "contributors": [
     {
@@ -31,29 +26,54 @@
       "url": "https://github.com/jimmygchen"
     }
   ],
-  "license": "MIT",
-  "bugs": {
-    "url": "https://github.com/SolZeroAI/routact/issues"
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SolZeroAI/routact.git"
   },
-  "homepage": "https://github.com/SolZeroAI/routact#readme",
+  "main": "index.js",
+  "scripts": {
+    "build": "ncc build index.js -o dist --source-map --license licenses.txt",
+    "check": "nub run lint && nub run format && nub run test && nub run build",
+    "check-dist": "nub run build && git diff --exit-code --ignore-space-at-eol -- dist",
+    "format": "oxfmt --check",
+    "format:fix": "oxfmt",
+    "lint": "NODE_OPTIONS='--import tsx' oxlint",
+    "lint:fix": "NODE_OPTIONS='--import tsx' oxlint --fix",
+    "tegami": "tsx scripts/tegami.mts",
+    "test": "jest"
+  },
   "dependencies": {
     "@actions/core": "^1.11.1",
     "@actions/http-client": "^3.0.0"
   },
   "devDependencies": {
-    "@eslint/eslintrc": "^3.3.1",
-    "@eslint/js": "^9.39.1",
+    "@oxlint/plugins": "1.89.0",
     "@vercel/ncc": "^0.38.4",
-    "eslint": "^9.39.1",
-    "globals": "^16.5.0",
-    "jest": "^30.2.0"
+    "anti-slop": "github:dmmulroy/anti-slop",
+    "jest": "^30.2.0",
+    "oxfmt": "0.74.0",
+    "oxlint": "1.89.0",
+    "tegami": "1.5.0",
+    "tsx": "^4.20.6"
   },
   "jest": {
     "testMatch": [
       "**/__tests__/**/*.test.js"
     ]
   },
+  "devEngines": {
+    "packageManager": {
+      "name": "nub",
+      "version": "0.9.6",
+      "onFail": "warn"
+    },
+    "runtime": {
+      "name": "node",
+      "version": "24.15.0"
+    }
+  },
   "engines": {
-    "node": ">=24"
-  }
+    "node": ">=24.15.0 <25"
+  },
+  "packageManager": "nub@0.9.6"
 }
