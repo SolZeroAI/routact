@@ -2,7 +2,7 @@
 #
 #   jobs:
 #     route:
-#       uses: SolZeroAI/routact/.github/workflows/route.yml@master
+#       uses: SolZeroAI/routact/.github/workflows/route.yml@v2
 #       secrets: inherit
 #     build:
 #       needs: route
@@ -99,7 +99,7 @@ jobs:
 
       - name: Route
         id: route
-        uses: SolZeroAI/routact@master
+        uses: SolZeroAI/routact@v2
         env:
           ROUTACT_CHECK_TOKEN: ${{ secrets.ROUTACT_CHECK_TOKEN }}
         with:

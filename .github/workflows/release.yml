@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows:
+      - Validate
+    types:
+      - completed
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-master
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Version with Tegami and move the major tag
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'master' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # The app opens tegami/version-packages, so pull_request workflows start.
+      - name: Create release app token
+        id: release-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Checkout validated commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          # Credentials stay in the checkout so the release and major tag pushes use this token.
+          token: ${{ steps.release-token.outputs.token }}
+
+      - name: Setup nub
+        uses: nubjs/setup-nub@v0
+        with:
+          nub-version: "0.9.6"
+          node-version-file: .node-version
+          cache-dependency-path: nub.lock
+
+      - name: Install
+        run: nub install --frozen-lockfile
+
+      - name: Version or publish
+        run: nub run tegami ci
+        env:
+          GITHUB_TOKEN: ${{ steps.release-token.outputs.token }}
+
+      # Validate's push trigger is the master branch. This tag push stays outside
+      # that trigger, so this job does not run again.
+      - name: Move the major tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          node --import tsx scripts/move-major-tag.mts
