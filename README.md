@@ -56,7 +56,7 @@ Save this as the org variable `ROUTACT_CONFIG` (Settings → Secrets and variabl
 }
 ```
 
-Each pool has `primary` labels, `fallback` labels, and optionally `primaries-required` (see [Inputs](#inputs)). Labels can be a comma-separated string or an array.
+Each pool has `primary` labels, `fallback` labels, and optionally `primaries-required` (see [Inputs](#inputs)) or `heartbeat` (see [Runners that register on demand](#runners-that-register-on-demand)). Labels can be a comma-separated string or an array.
 
 ### 3. Add the route job to a workflow
 
@@ -163,6 +163,25 @@ The check reads the organization's [billing usage summary](https://docs.github.c
 - When the usage cannot be read (no token, no organization, missing permission, API error), the check fails and the router moves on to the next step.
 - GitHub updates billing usage with a delay, so a few jobs can still start on paid minutes right after the included minutes run out.
 - The check counts the whole organization. Public repositories use GitHub-hosted runners for free, so do not route them through a pool that ends on a self-hosted runner.
+
+### Runners that register on demand
+
+Some autoscalers register a runner only when a matching job is queued, or keep a single warm runner that is busy while it works and gone for a few seconds after each job. Routact cannot see those runners when it routes, so `primaries-required` falls back even though the host would take the job. Use `heartbeat` instead: labels of a runner that only shows the host is up. While any online runner has those labels, busy or not, the pool uses its primary, and the autoscaler starts a runner for the queued job.
+
+```json
+"xcode": {
+  "primary": "self-hosted,macOS,ARM64,xcode",
+  "heartbeat": "self-hosted,kinhin-container",
+  "fallback": [
+    { "runs-on": "blacksmith-6vcpu-macos-26", "when": { "var": "ROUTACT_BLACKSMITH_ENABLED" } },
+    { "runs-on": "self-hosted,macOS,ARM64,xcode" }
+  ]
+}
+```
+
+- A heartbeat pool cannot set `primaries-required` or use `claim`, because it does not count idle runners.
+- While no heartbeat runner is online, for example in the seconds between two ephemeral runners, the pool falls back. Pick a heartbeat runner that the autoscaler keeps registered.
+- The heartbeat runner proves the host is up, not that it can start the primary. A host that is up but cannot start a matching runner leaves the job queued.
 
 ### Where the route job runs
 

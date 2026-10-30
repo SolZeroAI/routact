@@ -19,6 +19,16 @@ describe('parseConfig', () => {
     ]);
   });
 
+  it('parses a heartbeat', () => {
+    const pool = parseConfig('{"mac":{"primary":"self-hosted,macOS","heartbeat":"self-hosted,kinhin-container","fallback":"macos-26"}}').pools[0];
+    expect(pool.heartbeat).toEqual(['self-hosted', 'kinhin-container']);
+  });
+
+  it('rejects a heartbeat with primaries-required', () => {
+    expect(() => parseConfig('{"mac":{"primary":"a","heartbeat":"b","primaries-required":1,"fallback":"c"}}'))
+      .toThrow(/both heartbeat and primaries-required/);
+  });
+
   it('accepts a bare object of pools', () => {
     expect(parseConfig('{"x":{"primary":"a","fallback":"b"}}').pools[0].name).toBe('x');
   });

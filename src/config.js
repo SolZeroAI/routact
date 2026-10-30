@@ -52,8 +52,14 @@ function parsePool(name, value) {
     primary: parseLabels(value.primary),
     fallbacks: parseFallbacks(value.fallback, `Pool "${name}"`),
     primariesRequired: parseCount(value['primaries-required'], `Pool "${name}" primaries-required`),
+    heartbeat: parseLabels(value.heartbeat),
   };
   if (pool.primary.length === 0) throw new ConfigError(`Pool "${name}" has no primary labels`);
+  if (pool.heartbeat.length === 0) {
+    delete pool.heartbeat;
+  } else if (pool.primariesRequired !== undefined) {
+    throw new ConfigError(`Pool "${name}" sets both heartbeat and primaries-required; a heartbeat pool does not count idle runners`);
+  }
   return pool;
 }
 

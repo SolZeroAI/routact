@@ -72,6 +72,39 @@ describe('decide', () => {
   });
 });
 
+describe('decide with a heartbeat', () => {
+  const xcode = (overrides = {}) => linux({
+    name: 'xcode',
+    primary: ['self-hosted', 'macOS', 'ARM64', 'xcode'],
+    fallback: ['blacksmith-6vcpu-macos-26'],
+    heartbeat: ['self-hosted', 'kinhin-container'],
+    ...overrides,
+  });
+  const beat = (id, options) => runner(id, ['self-hosted', 'linux', 'ARM64', 'kinhin-container'], options);
+
+  it('uses the primary while a heartbeat runner is online, though no primary is registered', () => {
+    const decision = decide(xcode(), [beat(1)]);
+    expect(decision.usePrimary).toBe(true);
+    expect(decision.reason).toBe('1 heartbeat runner (self-hosted,kinhin-container) online');
+  });
+
+  it('counts a busy heartbeat runner', () => {
+    expect(decide(xcode(), [beat(1, { busy: true })]).usePrimary).toBe(true);
+  });
+
+  it('falls back when no heartbeat runner is online', () => {
+    const decision = decide(xcode(), [beat(1, { status: 'offline' }), selfHosted(2)]);
+    expect(decision.usePrimary).toBe(false);
+    expect(decision.reason).toBe('no heartbeat runner (self-hosted,kinhin-container) is online');
+  });
+
+  it('refuses to claim a runner for a heartbeat pool', async () => {
+    const client = new FakeClient([beat(1)]);
+    await expect(routePools({ client, claim: true, pools: [xcode({ fallback: ['self-hosted', 'macOS', 'ARM64'] })] }))
+      .rejects.toThrow(/heartbeat/);
+  });
+});
+
 describe('checkPlatform', () => {
   it('throws when the fallback is a different platform', () => {
     const pool = linux({ primary: ['self-hosted', 'macOS', 'ARM64'], fallback: ['ubuntu-latest'] });

@@ -146,8 +146,26 @@ async function fallbackResult(pool, reason, options) {
   };
 }
 
+// A heartbeat pool's primary runners register only when a job is queued, so
+// any online runner with the heartbeat labels, busy or not, shows the host is up
+function decideHeartbeat(pool, runners) {
+  const alive = runners.filter((runner) => runner.status === 'online' && hasLabels(runner, pool.heartbeat));
+  const labels = pool.heartbeat.join(',');
+  if (alive.length === 0) {
+    return { usePrimary: false, matching: [], idle: [], reason: `no heartbeat runner (${labels}) is online` };
+  }
+  const matching = runners.filter((runner) => runner.status === 'online' && hasLabels(runner, pool.primary));
+  return {
+    usePrimary: true,
+    matching,
+    idle: [],
+    reason: `${alive.length} heartbeat runner${alive.length === 1 ? '' : 's'} (${labels}) online`,
+  };
+}
+
 // Pure decision for one pool given the current runner list
 function decide(pool, runners, { claim = false, now = Date.now(), claimTtlMs } = {}) {
+  if (pool.heartbeat) return decideHeartbeat(pool, runners);
   const matching = runners.filter((runner) => runner.status === 'online' && hasLabels(runner, pool.primary));
   const idle = matching.filter((runner) => runner.busy !== true
     && (!claim || liveClaims(runner, now, claimTtlMs).length === 0));
@@ -270,6 +288,11 @@ async function routePools({
 
   for (const pool of pools) {
     checkPlatform(pool, runners, platformCheck).forEach((message) => warn(message));
+  }
+
+  const heartbeatPool = pools.find((pool) => pool.heartbeat);
+  if (claim && heartbeatPool) {
+    throw new ConfigError(`Pool "${heartbeatPool.name}" uses a heartbeat, which cannot claim a runner; turn claim off`);
   }
 
   if (claim) {
