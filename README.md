@@ -161,6 +161,16 @@ The check reads the organization's [billing usage summary](https://docs.github.c
 - GitHub updates billing usage with a delay, so a few jobs can still start on paid minutes right after the included minutes run out.
 - The check counts the whole organization. Public repositories use GitHub-hosted runners for free, so do not route them through a pool that ends on a self-hosted runner.
 
+### Where the route job runs
+
+The reusable workflow runs the route job on GitHub's `ubuntu-slim`. When a private repository's GitHub-hosted minutes are used up and the spending limit is reached, GitHub does not start that job, so nothing can be routed. To route from a runner that does not use GitHub's minutes, set the org variable `ROUTACT_ROUTER_RUNS_ON` (or the `runs-on` input) to a JSON label or label array:
+
+```sh
+gh variable set ROUTACT_ROUTER_RUNS_ON --org your-org --body '"blacksmith-2vcpu-ubuntu-2404"'
+```
+
+Do not point it at a self-hosted pool that the router checks. When that pool is full, the route job would wait behind the jobs it is meant to route away from.
+
 ### Fork pull requests
 
 Fork PRs skip the primary and every fallback step labelled `self-hosted`. Other checks still run, so a fork PR can use Blacksmith when it is enabled.
