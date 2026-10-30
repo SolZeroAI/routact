@@ -19,6 +19,8 @@ nub run check-dist  # build, then fail if dist/ changed
 
 `nub run lint:fix` and `nub run format:fix` fix what they can.
 
+Build `dist/` with nub `0.9.6` exactly. ncc derives module ids from the paths in `node_modules`, and another nub version can lay that folder out differently, so the bundle differs and CI's check-dist fails. When that happens, the failed Validate run uploads the expected `dist/` as an artifact.
+
 The source is plain JavaScript, so there is no typecheck step. Two anti-slop rules are warnings, not errors: `no-runtime-typeof` (plain JavaScript has no type predicates for the config parsing in `src/config.js`, `src/checks.js` and `src/maintain.js`) and `no-module-mocking` (`__tests__/index.test.js` mocks the GitHub client). Fix them in a cleanup pull request, then make them errors.
 
 ## Pull requests
