@@ -19,7 +19,7 @@ nub run check-dist  # build, then fail if dist/ changed
 
 `nub run lint:fix` and `nub run format:fix` fix what they can.
 
-The source is plain JavaScript, so there is no typecheck step. Two anti-slop rules are warnings, not errors: `no-runtime-typeof` (plain JavaScript has no type predicates for the config parsing in `src/config.js` and `src/checks.js`) and `no-module-mocking` (`__tests__/index.test.js` mocks the GitHub client). Fix them in a cleanup pull request, then make them errors.
+The source is plain JavaScript, so there is no typecheck step. Two anti-slop rules are warnings, not errors: `no-runtime-typeof` (plain JavaScript has no type predicates for the config parsing in `src/config.js`, `src/checks.js` and `src/maintain.js`) and `no-module-mocking` (`__tests__/index.test.js` mocks the GitHub client). Fix them in a cleanup pull request, then make them errors.
 
 ## Pull requests
 

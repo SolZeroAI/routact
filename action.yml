@@ -59,6 +59,20 @@ inputs:
   release:
     description: "Release claims instead of routing: pass the claims output of the routing step"
     required: false
+  mode:
+    description: 'route (default) or maintain: validate config, review GitHub-hosted images and update flag variables. See README, "Maintenance".'
+    required: false
+    default: "route"
+  tasks:
+    description: "Maintenance tasks to run, comma-separated: validate, images, flags. Default is all."
+    required: false
+  flags:
+    description: 'Maintenance: JSON object of org variable name to shell command. The variable is set to "true" when the command exits 0, else "false".'
+    required: false
+  apply-upgrades:
+    description: "Maintenance: write newer GitHub-hosted image labels into ROUTACT_CONFIG instead of only suggesting them"
+    required: false
+    default: "false"
 outputs:
   use-runner:
     description: "JSON label array for runs-on, read with fromJson. Set when exactly one pool is routed."
@@ -76,6 +90,10 @@ outputs:
     description: "JSON object of pool name to {labels, isPrimary, fallbackStep, runnerName, claim, reason}"
   claims:
     description: "Comma-separated claims made by this run, to pass to release"
+  problems:
+    description: "Maintenance: number of problems found"
+  suggested-config:
+    description: "Maintenance: ROUTACT_CONFIG with newer GitHub-hosted image labels, when there are any"
 runs:
   using: "node24"
   main: "dist/index.js"

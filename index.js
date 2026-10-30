@@ -1,9 +1,10 @@
 const core = require("@actions/core")
-const { RunnerClient, apiPathFor, fetchActionsSpend } = require("./src/github")
+const { RunnerClient, apiPathFor, fetchActionsSpend, setOrgVariable } = require("./src/github")
 const { parseConfig, resolvePools } = require("./src/config")
 const { isForkPullRequest } = require("./src/event")
 const { ConfigError, routePools, fallbackResults, parseClaims } = require("./src/route")
 const { parseVars } = require("./src/checks")
+const { maintain, parseTasks, parseFlags } = require("./src/maintain")
 
 const PLATFORM_CHECKS = ["error", "warn", "off"]
 
@@ -244,7 +245,143 @@ async function route() {
   }
 }
 
+async function runMaintenance() {
+  const config = core.getInput("config")
+  let organization
+
+  try {
+    organization = core.getInput("organization") || JSON.parse(config || "{}").organization
+  } catch {
+    organization = core.getInput("organization")
+  }
+
+  let inputs
+
+  try {
+    inputs = {
+      tasks: parseTasks(core.getInput("tasks")),
+      flags: parseFlags(core.getInput("flags")),
+      vars: parseVars(core.getInput("vars")),
+      applyUpgrades: core.getBooleanInput("apply-upgrades"),
+      timeoutSeconds: Number(core.getInput("check-timeout-seconds") || 20),
+    }
+  } catch (error) {
+    core.setFailed(error.message)
+
+    return
+  }
+
+  const token = core.getInput("github-token")
+  const writesVariables = inputs.flags.length > 0 || inputs.applyUpgrades
+
+  if (writesVariables && !organization) {
+    core.setFailed(
+      "Maintenance that sets variables needs an organization, from the organization input or config.",
+    )
+
+    return
+  }
+
+  let runnerClient
+
+  try {
+    runnerClient = client({ token, organization, enterprise: core.getInput("enterprise") })
+  } catch (error) {
+    core.setFailed(error.message)
+
+    return
+  }
+
+  const report = await maintain({
+    configText: config,
+    tasks: inputs.tasks,
+    client: runnerClient,
+    vars: inputs.vars,
+    flags: inputs.flags,
+    applyUpgrades: inputs.applyUpgrades,
+    timeoutSeconds: inputs.timeoutSeconds,
+    commandEnv: { ROUTACT_ORGANIZATION: organization || "" },
+    setVariable: (name, value) =>
+      setOrgVariable({
+        token,
+        organization,
+        name,
+        value,
+        baseUrl: process.env.GITHUB_API_URL || "https://api.github.com",
+      }),
+    log: (message) => core.info(message),
+  })
+
+  report.warnings.forEach((message) => core.warning(message))
+  report.errors.forEach((message) => core.error(message))
+
+  for (const flag of report.flags) {
+    core.info(`${flag.name} = ${flag.value}${flag.changed ? " (updated)" : ""}`)
+  }
+
+  core.setOutput("problems", String(report.errors.length))
+  core.setOutput("suggested-config", report.suggestedConfig || "")
+
+  try {
+    await writeMaintenanceSummary(report)
+  } catch (error) {
+    core.warning(`Could not write job summary: ${error.message}`)
+  }
+
+  if (report.errors.length > 0) {
+    core.setFailed(
+      `Routact maintenance found ${report.errors.length} problem(s); see the job summary.`,
+    )
+  }
+}
+
+async function writeMaintenanceSummary(report) {
+  const summary = core.summary.addHeading("Routact maintenance", 3)
+
+  if (report.flags.length > 0) {
+    summary.addTable([
+      [
+        { data: "Variable", header: true },
+        { data: "Value", header: true },
+        { data: "Changed", header: true },
+      ],
+      ...report.flags.map((flag) => [flag.name, flag.value, flag.changed ? "yes" : "no"]),
+    ])
+  }
+
+  if (report.errors.length > 0) summary.addHeading("Problems", 4).addList(report.errors)
+
+  if (report.warnings.length > 0) summary.addHeading("Warnings", 4).addList(report.warnings)
+  const upgrades = Object.entries(report.upgrades)
+
+  if (upgrades.length > 0) {
+    summary
+      .addHeading("Newer GitHub-hosted images", 4)
+      .addList(upgrades.map(([from, to]) => `${from} → ${to}`))
+    summary.addRaw(
+      report.applied
+        ? "ROUTACT_CONFIG was updated with these labels."
+        : "Suggested ROUTACT_CONFIG (not applied, set apply-upgrades to apply automatically):",
+      true,
+    )
+
+    if (!report.applied) summary.addCodeBlock(report.suggestedConfig, "json")
+  }
+
+  if (report.errors.length === 0 && report.warnings.length === 0 && upgrades.length === 0) {
+    summary.addRaw("No problems found.", true)
+  }
+
+  await summary.write()
+}
+
 async function main() {
+  if ((core.getInput("mode") || "route").toLowerCase() === "maintain") {
+    await runMaintenance()
+
+    return
+  }
+
   const claimsToRelease = core.getInput("release")
 
   if (claimsToRelease) {

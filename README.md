@@ -135,7 +135,7 @@ The route job does not check out your repository, so a command cannot run script
 Each check adds time to every route job, so keep slow checks out of it. For Blacksmith, the fast pattern is a variable flag:
 
 1. Gate the Blacksmith step on `{"var": "ROUTACT_BLACKSMITH_ENABLED"}`.
-2. Set the org variable to `false` when the month's minutes run out, and back to `true` when they reset. You can do it by hand, or with a scheduled workflow that runs the [Blacksmith CLI](https://docs.blacksmith.sh/blacksmith-cli/usage) (`blacksmith usage`) and updates the variable with `gh variable set`.
+2. Set the org variable to `false` when the month's minutes run out, and back to `true` when they reset. Do it by hand, or let the [maintenance job](#maintenance) do it with a flag command that runs the [Blacksmith CLI](https://docs.blacksmith.sh/blacksmith-cli/usage) (`blacksmith usage`).
 
 ### GitHub-hosted minutes
 
@@ -247,6 +247,42 @@ Things to know:
 - A claimed job targets one runner. If that runner goes offline before the job starts, the job waits until it times out, so set `timeout-minutes` on jobs that use claims.
 - Runners whose labels cannot be edited (for example Actions Runner Controller scale sets) cannot be claimed.
 
+## Maintenance
+
+A scheduled maintenance job keeps the org settings honest. It runs the action with `mode: maintain` through the reusable workflow `.github/workflows/maintain.yml`, on the same runner as the route job (`ROUTACT_ROUTER_RUNS_ON`, else `ubuntu-slim`). It has three tasks:
+
+| Task | What it does |
+| --- | --- |
+| `validate` | Checks `ROUTACT_CONFIG` against the registered runners. It fails on an invalid config or a fallback with another OS or architecture, and warns about pools with no registered or online runners, and about `var` checks on variables that are not set. |
+| `images` | Checks every GitHub-hosted label in the fallbacks against the current [runner-images](https://github.com/actions/runner-images) list. It fails on retired or deprecated labels, warns about beta and preview images, and suggests the newest generally available label of the same kind (for example `ubuntu-24.04` to `ubuntu-26.04`, or `macos-15-intel` to `macos-26-intel`). The suggested config is in the job summary and the `suggested-config` output. It changes `ROUTACT_CONFIG` only with `apply-upgrades: true`, because a new image can break builds. |
+| `flags` | Runs each command in the org variable `ROUTACT_FLAGS` and sets the named org variable to `true` when it exits 0, else `false`. This is how slow checks such as Blacksmith minutes stay out of the route job. |
+
+`ROUTACT_FLAGS` maps variable names to shell commands:
+
+```json
+{ "ROUTACT_BLACKSMITH_ENABLED": "curl -fsS -H \"Authorization: Bearer $ROUTACT_CHECK_TOKEN\" https://ci-budget.example.com/blacksmith/ok" }
+```
+
+Commands get `ROUTACT_ORGANIZATION` and, through the reusable workflow, the `ROUTACT_CHECK_TOKEN` secret, and have 120 seconds each.
+
+To schedule it, call the reusable workflow from one repository (SolZeroAI's runs from this repository, see `.github/workflows/solzero-maintain.yml`):
+
+```yaml
+on:
+  schedule:
+    - cron: '17 * * * *'   # hourly: flags only
+    - cron: '23 6 * * *'   # daily: everything
+  workflow_dispatch:
+jobs:
+  maintain:
+    uses: SolZeroAI/routact/.github/workflows/maintain.yml@v2
+    secrets: inherit
+    with:
+      tasks: ${{ github.event.schedule == '17 * * * *' && 'flags' || '' }}
+```
+
+Setting variables needs the GitHub App's organization permission **Variables: Read and write**. Validation needs only Self-hosted runners: Read. Problems fail the job, so GitHub's failed-workflow email tells you about them.
+
 ## Inputs
 
 | Name | Default | Description |
@@ -267,6 +303,10 @@ Things to know:
 | `claim` | `false` | Claim a specific idle runner (see [Runner claims](#runner-claims)). |
 | `claim-ttl-minutes` | `10` | Minutes before an unreleased claim expires. |
 | `release` | | Release these claims instead of routing. |
+| `mode` | `route` | `maintain` runs the [maintenance](#maintenance) tasks instead of routing. |
+| `tasks` | all | Maintenance tasks: `validate`, `images`, `flags`. |
+| `flags` | | Maintenance: JSON object of org variable name to shell command. |
+| `apply-upgrades` | `false` | Maintenance: write newer GitHub-hosted labels into `ROUTACT_CONFIG`. |
 
 ## Outputs
 
@@ -280,6 +320,8 @@ Things to know:
 | `runners` | JSON object of pool name to label array. The single-pool inputs use the pool name `default`. |
 | `details` | JSON object of pool name to `{labels, isPrimary, fallbackStep, runnerName, claim, reason}`. |
 | `claims` | Comma-separated claims made by this run, for `release`. |
+| `problems` | Maintenance: number of problems found. |
+| `suggested-config` | Maintenance: `ROUTACT_CONFIG` with newer GitHub-hosted labels, when there are any. |
 
 ## How the platform check works
 
@@ -295,7 +337,7 @@ If either side cannot be fully determined, Routact warns instead of failing. Add
 
 Releases follow [semantic versioning](https://semver.org). Each release has a `vX.Y.Z` tag and a GitHub Release with its notes. See [CHANGELOG.md](CHANGELOG.md).
 
-- Pin the major tag, `SolZeroAI/routact@v2` (or `.../route.yml@v2`), to get fixes and new features without breaking changes. It moves to each new `v2.x.y` release.
+- Pin the major tag, `SolZeroAI/routact@v2` (or `.../route.yml@v2` and `.../maintain.yml@v2`), to get fixes and new features without breaking changes. It moves to each new `v2.x.y` release.
 - Pin an exact tag such as `@v2.0.0`, or a commit SHA, to control every update yourself.
 - `@master` is the development branch. Do not use it in production workflows.
 

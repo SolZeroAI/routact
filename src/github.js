@@ -145,6 +145,51 @@ async function fetchActionsSpend({
     .reduce((total, item) => total + (Number(item.netAmount) || 0), 0)
 }
 
+// Creates or updates an organization Actions variable visible to all repos.
+// Needs the organization permission Variables: read and write.
+async function setOrgVariable({
+  token,
+  organization,
+  name,
+  value,
+  baseUrl = "https://api.github.com",
+  http,
+}) {
+  const client = http || new httpClient.HttpClient("routact", [], { socketTimeout: 15000 })
+
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": API_VERSION,
+    "Content-Type": "application/json",
+  }
+
+  const root = `${baseUrl.replace(/\/$/, "")}/orgs/${organization}/actions/variables`
+
+  const send = async (verb, url, body) => {
+    const response = await client.request(verb, url, JSON.stringify(body), headers)
+    const statusCode = response.message.statusCode
+    const text = await response.readBody()
+
+    return { statusCode, text }
+  }
+
+  let response = await send("PATCH", `${root}/${encodeURIComponent(name)}`, { name, value })
+
+  if (response.statusCode === 404) {
+    response = await send("POST", root, { name, value, visibility: "all" })
+  }
+
+  if (response.statusCode !== 204 && response.statusCode !== 201) {
+    const hint =
+      response.statusCode === 403 || response.statusCode === 404
+        ? " Check that the token has the organization permission Variables: read and write."
+        : ""
+
+    throw new Error(`Failed to set variable ${name}. Status code: ${response.statusCode}.${hint}`)
+  }
+}
+
 function assertOk(response, action) {
   if (response.statusCode !== 200 && response.statusCode !== 201) {
     const hint =
@@ -171,4 +216,4 @@ function apiPathFor({ repository, organization, enterprise }) {
   return `repos/${repository}/actions/runners`
 }
 
-module.exports = { RunnerClient, apiPathFor, fetchActionsSpend }
+module.exports = { RunnerClient, apiPathFor, fetchActionsSpend, setOrgVariable }

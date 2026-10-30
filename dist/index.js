@@ -5,11 +5,12 @@ require('./sourcemap-register.js');/******/ (() => { // webpackBootstrap
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 const core = __nccwpck_require__(7983)
-const { RunnerClient, apiPathFor, fetchActionsSpend } = __nccwpck_require__(2726)
+const { RunnerClient, apiPathFor, fetchActionsSpend, setOrgVariable } = __nccwpck_require__(2726)
 const { parseConfig, resolvePools } = __nccwpck_require__(5639)
 const { isForkPullRequest } = __nccwpck_require__(4493)
 const { ConfigError, routePools, fallbackResults, parseClaims } = __nccwpck_require__(1404)
 const { parseVars } = __nccwpck_require__(7164)
+const { maintain, parseTasks, parseFlags } = __nccwpck_require__(9236)
 
 const PLATFORM_CHECKS = ["error", "warn", "off"]
 
@@ -250,7 +251,143 @@ async function route() {
   }
 }
 
+async function runMaintenance() {
+  const config = core.getInput("config")
+  let organization
+
+  try {
+    organization = core.getInput("organization") || JSON.parse(config || "{}").organization
+  } catch {
+    organization = core.getInput("organization")
+  }
+
+  let inputs
+
+  try {
+    inputs = {
+      tasks: parseTasks(core.getInput("tasks")),
+      flags: parseFlags(core.getInput("flags")),
+      vars: parseVars(core.getInput("vars")),
+      applyUpgrades: core.getBooleanInput("apply-upgrades"),
+      timeoutSeconds: Number(core.getInput("check-timeout-seconds") || 20),
+    }
+  } catch (error) {
+    core.setFailed(error.message)
+
+    return
+  }
+
+  const token = core.getInput("github-token")
+  const writesVariables = inputs.flags.length > 0 || inputs.applyUpgrades
+
+  if (writesVariables && !organization) {
+    core.setFailed(
+      "Maintenance that sets variables needs an organization, from the organization input or config.",
+    )
+
+    return
+  }
+
+  let runnerClient
+
+  try {
+    runnerClient = client({ token, organization, enterprise: core.getInput("enterprise") })
+  } catch (error) {
+    core.setFailed(error.message)
+
+    return
+  }
+
+  const report = await maintain({
+    configText: config,
+    tasks: inputs.tasks,
+    client: runnerClient,
+    vars: inputs.vars,
+    flags: inputs.flags,
+    applyUpgrades: inputs.applyUpgrades,
+    timeoutSeconds: inputs.timeoutSeconds,
+    commandEnv: { ROUTACT_ORGANIZATION: organization || "" },
+    setVariable: (name, value) =>
+      setOrgVariable({
+        token,
+        organization,
+        name,
+        value,
+        baseUrl: process.env.GITHUB_API_URL || "https://api.github.com",
+      }),
+    log: (message) => core.info(message),
+  })
+
+  report.warnings.forEach((message) => core.warning(message))
+  report.errors.forEach((message) => core.error(message))
+
+  for (const flag of report.flags) {
+    core.info(`${flag.name} = ${flag.value}${flag.changed ? " (updated)" : ""}`)
+  }
+
+  core.setOutput("problems", String(report.errors.length))
+  core.setOutput("suggested-config", report.suggestedConfig || "")
+
+  try {
+    await writeMaintenanceSummary(report)
+  } catch (error) {
+    core.warning(`Could not write job summary: ${error.message}`)
+  }
+
+  if (report.errors.length > 0) {
+    core.setFailed(
+      `Routact maintenance found ${report.errors.length} problem(s); see the job summary.`,
+    )
+  }
+}
+
+async function writeMaintenanceSummary(report) {
+  const summary = core.summary.addHeading("Routact maintenance", 3)
+
+  if (report.flags.length > 0) {
+    summary.addTable([
+      [
+        { data: "Variable", header: true },
+        { data: "Value", header: true },
+        { data: "Changed", header: true },
+      ],
+      ...report.flags.map((flag) => [flag.name, flag.value, flag.changed ? "yes" : "no"]),
+    ])
+  }
+
+  if (report.errors.length > 0) summary.addHeading("Problems", 4).addList(report.errors)
+
+  if (report.warnings.length > 0) summary.addHeading("Warnings", 4).addList(report.warnings)
+  const upgrades = Object.entries(report.upgrades)
+
+  if (upgrades.length > 0) {
+    summary
+      .addHeading("Newer GitHub-hosted images", 4)
+      .addList(upgrades.map(([from, to]) => `${from} → ${to}`))
+    summary.addRaw(
+      report.applied
+        ? "ROUTACT_CONFIG was updated with these labels."
+        : "Suggested ROUTACT_CONFIG (not applied, set apply-upgrades to apply automatically):",
+      true,
+    )
+
+    if (!report.applied) summary.addCodeBlock(report.suggestedConfig, "json")
+  }
+
+  if (report.errors.length === 0 && report.warnings.length === 0 && upgrades.length === 0) {
+    summary.addRaw("No problems found.", true)
+  }
+
+  await summary.write()
+}
+
 async function main() {
+  if ((core.getInput("mode") || "route").toLowerCase() === "maintain") {
+    await runMaintenance()
+
+    return
+  }
+
   const claimsToRelease = core.getInput("release")
 
   if (claimsToRelease) {
@@ -865,6 +1002,51 @@ async function fetchActionsSpend({
     .reduce((total, item) => total + (Number(item.netAmount) || 0), 0)
 }
 
+// Creates or updates an organization Actions variable visible to all repos.
+// Needs the organization permission Variables: read and write.
+async function setOrgVariable({
+  token,
+  organization,
+  name,
+  value,
+  baseUrl = "https://api.github.com",
+  http,
+}) {
+  const client = http || new httpClient.HttpClient("routact", [], { socketTimeout: 15000 })
+
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": API_VERSION,
+    "Content-Type": "application/json",
+  }
+
+  const root = `${baseUrl.replace(/\/$/, "")}/orgs/${organization}/actions/variables`
+
+  const send = async (verb, url, body) => {
+    const response = await client.request(verb, url, JSON.stringify(body), headers)
+    const statusCode = response.message.statusCode
+    const text = await response.readBody()
+
+    return { statusCode, text }
+  }
+
+  let response = await send("PATCH", `${root}/${encodeURIComponent(name)}`, { name, value })
+
+  if (response.statusCode === 404) {
+    response = await send("POST", root, { name, value, visibility: "all" })
+  }
+
+  if (response.statusCode !== 204 && response.statusCode !== 201) {
+    const hint =
+      response.statusCode === 403 || response.statusCode === 404
+        ? " Check that the token has the organization permission Variables: read and write."
+        : ""
+
+    throw new Error(`Failed to set variable ${name}. Status code: ${response.statusCode}.${hint}`)
+  }
+}
+
 function assertOk(response, action) {
   if (response.statusCode !== 200 && response.statusCode !== 201) {
     const hint =
@@ -891,7 +1073,450 @@ function apiPathFor({ repository, organization, enterprise }) {
   return `repos/${repository}/actions/runners`
 }
 
-module.exports = { RunnerClient, apiPathFor, fetchActionsSpend }
+module.exports = { RunnerClient, apiPathFor, fetchActionsSpend, setOrgVariable }
+
+
+/***/ }),
+
+/***/ 9511:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+const httpClient = __nccwpck_require__(882)
+
+// GitHub-hosted images, read from the table at the top of the runner-images
+// README so new and deprecated images show up without a Routact release.
+const IMAGES_README = "https://raw.githubusercontent.com/actions/runner-images/main/README.md"
+const HOSTED_LABEL = /^(ubuntu|macos|windows|xcode)-/
+
+// Returns [{name, arch, labels: [...], status: 'ga' | 'beta' | 'preview' | 'deprecated'}]
+function parseImages(markdown) {
+  const images = []
+  let inTable = false
+
+  for (const line of markdown.split("\n")) {
+    if (/^\|\s*Image\s*\|.*YAML Label/i.test(line)) {
+      inTable = true
+      continue
+    }
+
+    if (!inTable) continue
+
+    if (!line.startsWith("|")) {
+      if (images.length > 0) break
+      continue
+    }
+
+    const cells = line
+      .split("|")
+      .slice(1, -1)
+      .map((cell) => cell.trim())
+
+    if (cells.length < 3 || /^-+$/.test(cells[0].replace(/\s/g, ""))) continue
+    const [imageCell, arch, labelCell] = cells
+    const labels = [...labelCell.matchAll(/`([^`]+)`/g)].map((match) => match[1].toLowerCase())
+
+    if (labels.length === 0) continue
+    const badge = /badge\/(deprecated|beta|preview)-/i.exec(imageCell)
+    images.push({
+      name: imageCell
+        .split("<br>")[0]
+        .replace(/\[!\[.*$/, "")
+        .trim(),
+      arch: arch.toLowerCase(),
+      labels,
+      status: badge ? badge[1].toLowerCase() : "ga",
+    })
+  }
+
+  return images
+}
+
+async function fetchImages({ http } = {}) {
+  const client =
+    http ||
+    new httpClient.HttpClient("routact", [], {
+      allowRetries: true,
+      maxRetries: 3,
+      socketTimeout: 15000,
+    })
+
+  const response = await client.get(IMAGES_README)
+  const body = await response.readBody()
+
+  if (response.message.statusCode !== 200) {
+    throw new Error(`Could not read the runner-images list (status ${response.message.statusCode})`)
+  }
+
+  const images = parseImages(body)
+
+  if (images.length === 0)
+    throw new Error("Could not find the image table in the runner-images README")
+
+  return images
+}
+
+function isHostedLabel(label) {
+  return HOSTED_LABEL.test(label.toLowerCase())
+}
+
+function findImage(images, label) {
+  return images.find((image) => image.labels.includes(label.toLowerCase()))
+}
+
+function versionOf(label) {
+  const match = /-(\d+(?:\.\d+)?)(?=-|$)/.exec(label)
+
+  return match ? match[1] : undefined
+}
+
+function compareVersions(a, b) {
+  const [aMajor, aMinor = 0] = a.split(".").map(Number)
+  const [bMajor, bMinor = 0] = b.split(".").map(Number)
+
+  return aMajor - bMajor || aMinor - bMinor
+}
+
+// The newest generally available label of the same kind, e.g. ubuntu-24.04-arm
+// -> ubuntu-26.04-arm or macos-15-intel -> macos-26-intel. Labels without a
+// version (ubuntu-latest) never get a suggestion.
+function newerLabel(images, label) {
+  const version = versionOf(label)
+
+  if (!version) return undefined
+
+  const available = new Set(
+    images.filter((image) => image.status === "ga").flatMap((image) => image.labels),
+  )
+
+  const candidates = images
+    .flatMap((image) => image.labels)
+    .map(versionOf)
+    .filter((candidate) => candidate && compareVersions(candidate, version) > 0)
+    .sort(compareVersions)
+    .reverse()
+
+  for (const candidate of candidates) {
+    const replacement = label.toLowerCase().replace(`-${version}`, `-${candidate}`)
+
+    if (available.has(replacement)) return replacement
+  }
+
+  return undefined
+}
+
+module.exports = { IMAGES_README, parseImages, fetchImages, isHostedLabel, findImage, newerLabel }
+
+
+/***/ }),
+
+/***/ 9236:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+const { ConfigError } = __nccwpck_require__(6794)
+const { parseConfig } = __nccwpck_require__(5639)
+const { hasLabels, checkPlatform } = __nccwpck_require__(1404)
+const images = __nccwpck_require__(9511)
+const checks = __nccwpck_require__(7164)
+
+const TASKS = ["validate", "images", "flags"]
+
+function parseTasks(text) {
+  const tasks = String(text || TASKS.join(","))
+    .split(",")
+    .map((task) => task.trim().toLowerCase())
+    .filter(Boolean)
+
+  const unknown = tasks.filter((task) => !TASKS.includes(task))
+
+  if (unknown.length > 0)
+    throw new ConfigError(
+      `Unknown maintenance tasks: ${unknown.join(", ")} (known: ${TASKS.join(", ")})`,
+    )
+
+  return tasks
+}
+
+// Flags: {"VARIABLE": "command"} or {"VARIABLE": {"command": "..."}}. Each
+// command runs on schedule and sets the org variable to "true" when it exits 0,
+// "false" otherwise, for "var" checks to read.
+function parseFlags(text) {
+  if (!text || !String(text).trim()) return []
+  let parsed
+
+  try {
+    parsed = JSON.parse(text)
+  } catch (error) {
+    throw new ConfigError(`flags is not valid JSON: ${error.message}`)
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new ConfigError("flags must be a JSON object of variable name to command")
+  }
+
+  return Object.entries(parsed).map(([name, value]) => {
+    const command = typeof value === "string" ? value : value && value.command
+
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))
+      throw new ConfigError(`flags: "${name}" is not a valid variable name`)
+
+    if (typeof command !== "string" || !command.trim())
+      throw new ConfigError(`flags: "${name}" needs a command`)
+
+    return { name, command }
+  })
+}
+
+function varNames(check) {
+  if (!check || typeof check !== "object") return []
+
+  if (check.var !== undefined) return [check.var]
+
+  if (check.not !== undefined) return varNames(check.not)
+
+  if (check.any !== undefined) return check.any.flatMap(varNames)
+
+  return []
+}
+
+function countMatching(runners, labels) {
+  const matching = runners.filter((runner) => hasLabels(runner, labels))
+
+  return {
+    registered: matching.length,
+    online: matching.filter((runner) => runner.status === "online").length,
+  }
+}
+
+function isSelfHosted(labels) {
+  return labels.some((label) => label.toLowerCase() === "self-hosted")
+}
+
+// Checks the config against the registered runners and the variables it reads
+function validate({ config, runners, vars }) {
+  const errors = []
+  const warnings = []
+
+  for (const pool of config.pools) {
+    try {
+      checkPlatform(pool, runners, "error").forEach((message) => warnings.push(message))
+    } catch (error) {
+      errors.push(error.message)
+    }
+
+    const primary = countMatching(runners, pool.primary)
+
+    if (primary.registered === 0) {
+      warnings.push(
+        `Pool "${pool.name}": no registered runner has all the primary labels ${pool.primary.join(",")}, so it always falls back.`,
+      )
+    } else if (primary.online === 0) {
+      warnings.push(`Pool "${pool.name}": all ${primary.registered} primary runners are offline.`)
+    }
+
+    pool.fallbacks.forEach((step, index) => {
+      const where = `Pool "${pool.name}" fallback step ${index + 1} (${step.labels.join(",")})`
+
+      if (isSelfHosted(step.labels) && countMatching(runners, step.labels).registered === 0) {
+        warnings.push(`${where}: no registered runner has these labels.`)
+      }
+
+      for (const name of step.when.flatMap(varNames)) {
+        if (vars[name] === undefined) {
+          warnings.push(
+            `${where}: checks the variable ${name}, which is not set, so the step is never used.`,
+          )
+        }
+      }
+    })
+  }
+
+  return { errors, warnings }
+}
+
+// Flags retired, deprecated and pre-release GitHub-hosted labels, and suggests
+// the newest generally available label of the same kind
+function reviewImages({ config, imageList }) {
+  const errors = []
+  const warnings = []
+  const upgrades = {}
+
+  for (const pool of config.pools) {
+    pool.fallbacks.forEach((step, index) => {
+      const where = `Pool "${pool.name}" fallback step ${index + 1}`
+
+      for (const label of step.labels.filter(images.isHostedLabel)) {
+        const image = images.findImage(imageList, label)
+        const newer = images.newerLabel(imageList, label)
+
+        if (!image) {
+          errors.push(
+            `${where}: "${label}" is not a current GitHub-hosted label (retired or misspelled)${newer ? `; use "${newer}"` : ""}.`,
+          )
+        } else if (image.status === "deprecated") {
+          errors.push(
+            `${where}: "${label}" is deprecated and will stop working${newer ? `; use "${newer}"` : ""}.`,
+          )
+        } else if (image.status !== "ga") {
+          warnings.push(`${where}: "${label}" is a ${image.status} image, without GitHub's SLA.`)
+        }
+
+        if (newer) upgrades[label.toLowerCase()] = newer
+      }
+    })
+  }
+
+  return { errors, warnings, upgrades }
+}
+
+function replaceLabels(value, upgrades) {
+  if (Array.isArray(value)) return value.map((label) => replaceLabels(label, upgrades))
+
+  if (typeof value !== "string") return value
+
+  return value
+    .split(",")
+    .map((label) => upgrades[label.trim().toLowerCase()] || label.trim())
+    .join(",")
+}
+
+// The raw config with every upgradable fallback label replaced, keeping its shape
+function upgradeConfig(raw, upgrades) {
+  const copy = JSON.parse(JSON.stringify(raw))
+  const pools = copy.pools || copy
+
+  for (const [name, pool] of Object.entries(pools)) {
+    if (["organization", "enterprise"].includes(name) || !pool || typeof pool !== "object") continue
+
+    if (
+      Array.isArray(pool.fallback) &&
+      pool.fallback.some((step) => step && typeof step === "object")
+    ) {
+      pool.fallback = pool.fallback.map((step) => ({
+        ...step,
+        "runs-on": replaceLabels(step["runs-on"], upgrades),
+      }))
+    } else {
+      pool.fallback = replaceLabels(pool.fallback, upgrades)
+    }
+  }
+
+  return copy
+}
+
+async function updateFlags({ flags, vars, run, setVariable, commandEnv, timeoutSeconds, log }) {
+  const results = []
+
+  for (const flag of flags) {
+    const passed = await run(flag.command, { env: commandEnv, timeoutSeconds, log })
+    const value = passed ? "true" : "false"
+    const changed = vars[flag.name] !== value
+
+    if (changed) await setVariable(flag.name, value)
+    results.push({ name: flag.name, value, changed })
+  }
+
+  return results
+}
+
+async function maintain({
+  configText,
+  tasks = TASKS,
+  client,
+  vars = {},
+  flags = [],
+  loadImages = images.fetchImages,
+  run = checks.runCommand,
+  setVariable,
+  applyUpgrades = false,
+  commandEnv = {},
+  timeoutSeconds = 60,
+  log = () => {},
+}) {
+  const report = {
+    errors: [],
+    warnings: [],
+    upgrades: {},
+    suggestedConfig: undefined,
+    flags: [],
+    applied: false,
+  }
+
+  if (tasks.includes("flags") && flags.length > 0) {
+    try {
+      report.flags = await updateFlags({
+        flags,
+        vars,
+        run,
+        setVariable,
+        commandEnv,
+        timeoutSeconds,
+        log,
+      })
+
+      // Later checks read the updated values
+      for (const flag of report.flags) vars = { ...vars, [flag.name]: flag.value }
+    } catch (error) {
+      report.errors.push(`Updating flags failed: ${error.message}`)
+    }
+  }
+
+  const wantsConfig = tasks.includes("validate") || tasks.includes("images")
+
+  if (!wantsConfig) return report
+
+  let config
+  let raw
+
+  try {
+    config = parseConfig(configText)
+    raw = JSON.parse(configText)
+  } catch (error) {
+    report.errors.push(`ROUTACT_CONFIG is invalid: ${error.message}`)
+
+    return report
+  }
+
+  if (!config) {
+    report.errors.push("ROUTACT_CONFIG is empty.")
+
+    return report
+  }
+
+  if (tasks.includes("validate")) {
+    try {
+      const runners = await client.listRunners()
+      const result = validate({ config, runners, vars })
+      report.errors.push(...result.errors)
+      report.warnings.push(...result.warnings)
+    } catch (error) {
+      report.errors.push(`Could not list runners: ${error.message}`)
+    }
+  }
+
+  if (tasks.includes("images")) {
+    try {
+      const result = reviewImages({ config, imageList: await loadImages() })
+      report.errors.push(...result.errors)
+      report.warnings.push(...result.warnings)
+      report.upgrades = result.upgrades
+
+      if (Object.keys(result.upgrades).length > 0) {
+        report.suggestedConfig = JSON.stringify(upgradeConfig(raw, result.upgrades), null, 2)
+
+        if (applyUpgrades) {
+          await setVariable("ROUTACT_CONFIG", JSON.stringify(upgradeConfig(raw, result.upgrades)))
+          report.applied = true
+        }
+      }
+    } catch (error) {
+      report.warnings.push(`Could not check GitHub-hosted images: ${error.message}`)
+    }
+  }
+
+  return report
+}
+
+module.exports = { TASKS, parseTasks, parseFlags, validate, reviewImages, upgradeConfig, maintain }
 
 
 /***/ }),

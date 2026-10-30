@@ -1,0 +1,24 @@
+# SolZeroAI's own Routact maintenance. Other organizations: copy this into a
+# repository of yours and drop the repository check.
+name: SolZeroAI Routact maintenance
+
+on:
+  schedule:
+    - cron: "17 * * * *" # hourly: flags only
+    - cron: "23 6 * * *" # daily: validate config, review images, flags
+  workflow_dispatch:
+    inputs:
+      tasks:
+        description: "Comma-separated tasks (validate, images, flags); empty runs all"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  maintain:
+    if: github.repository == 'SolZeroAI/routact'
+    uses: ./.github/workflows/maintain.yml
+    secrets: inherit
+    with:
+      tasks: ${{ github.event.inputs.tasks || (github.event.schedule == '17 * * * *' && 'flags' || '') }}

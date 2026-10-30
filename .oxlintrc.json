@@ -7,7 +7,7 @@
       "specifier": "anti-slop"
     }
   ],
-  "ignorePatterns": ["**/dist/**", "**/node_modules/**"],
+  "ignorePatterns": ["**/dist/**", "**/fixtures/**", "**/node_modules/**"],
   "rules": {
     "oxc/no-accumulating-spread": "error",
     "anti-slop/no-array-filter-map": "error",
