@@ -1,0 +1,96 @@
+# Reusable maintenance job. Call it on a schedule from one repository in the
+# organization:
+#
+#   on:
+#     schedule:
+#       - cron: '17 * * * *'   # hourly: flags only
+#       - cron: '23 6 * * *'   # daily: everything
+#   jobs:
+#     maintain:
+#       uses: SolZeroAI/routact/.github/workflows/maintain.yml@master
+#       secrets: inherit
+#       with:
+#         tasks: ${{ github.event.schedule == '17 * * * *' && 'flags' || '' }}
+#
+# It validates ROUTACT_CONFIG against the registered runners, checks its
+# GitHub-hosted labels against the current image list, and runs the flag
+# commands in ROUTACT_FLAGS to set variables such as ROUTACT_BLACKSMITH_ENABLED.
+name: Maintain
+
+on:
+  workflow_call:
+    inputs:
+      tasks:
+        description: 'Comma-separated tasks: validate, images, flags. Default is all.'
+        type: string
+        required: false
+      flags:
+        description: 'JSON object of variable name to command. Default is the ROUTACT_FLAGS variable.'
+        type: string
+        required: false
+      apply-upgrades:
+        description: 'Write newer GitHub-hosted image labels into ROUTACT_CONFIG instead of only suggesting them'
+        type: boolean
+        default: false
+      organization:
+        description: 'Default is the organization in ROUTACT_CONFIG, else the repository owner'
+        type: string
+        required: false
+      app-id:
+        description: 'GitHub App id. Default is the ROUTACT_APP_ID variable.'
+        type: string
+        required: false
+      runs-on:
+        description: 'Runner for this job, as JSON. Default is the ROUTACT_ROUTER_RUNS_ON variable, else "ubuntu-slim".'
+        type: string
+        required: false
+    secrets:
+      ROUTACT_APP_PRIVATE_KEY:
+        required: false
+      ROUTACT_TOKEN:
+        description: 'A token to use instead of a GitHub App'
+        required: false
+      ROUTACT_CHECK_TOKEN:
+        description: 'Exposed to flag commands as the ROUTACT_CHECK_TOKEN environment variable'
+        required: false
+    outputs:
+      problems:
+        value: ${{ jobs.maintain.outputs.problems }}
+      suggested-config:
+        value: ${{ jobs.maintain.outputs.suggested-config }}
+
+jobs:
+  maintain:
+    runs-on: ${{ fromJSON(inputs.runs-on || vars.ROUTACT_ROUTER_RUNS_ON || '"ubuntu-slim"') }}
+    timeout-minutes: 10
+    outputs:
+      problems: ${{ steps.maintain.outputs.problems }}
+      suggested-config: ${{ steps.maintain.outputs.suggested-config }}
+    steps:
+      # No permission-* inputs: setting variables needs the App's organization
+      # Variables permission, which create-github-app-token cannot request by
+      # name, so the token gets the App's installed permissions.
+      - name: Create GitHub App token
+        id: app-token
+        if: (inputs.app-id || vars.ROUTACT_APP_ID) != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ inputs.app-id || vars.ROUTACT_APP_ID }}
+          private-key: ${{ secrets.ROUTACT_APP_PRIVATE_KEY }}
+          owner: ${{ inputs.organization || github.repository_owner }}
+
+      - name: Maintain
+        id: maintain
+        uses: SolZeroAI/routact@master
+        env:
+          ROUTACT_CHECK_TOKEN: ${{ secrets.ROUTACT_CHECK_TOKEN }}
+        with:
+          mode: maintain
+          github-token: ${{ steps.app-token.outputs.token || secrets.ROUTACT_TOKEN }}
+          config: ${{ vars.ROUTACT_CONFIG }}
+          vars: ${{ toJSON(vars) }}
+          tasks: ${{ inputs.tasks }}
+          flags: ${{ inputs.flags || vars.ROUTACT_FLAGS }}
+          apply-upgrades: ${{ inputs.apply-upgrades }}
+          organization: ${{ inputs.organization }}
+          check-timeout-seconds: 120
