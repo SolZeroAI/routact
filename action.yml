@@ -18,7 +18,7 @@ inputs:
     description: 'Fall back unless at least this many matching primaries are online and idle. When empty, any online primary is enough, busy or not.'
     required: false
   config:
-    description: 'JSON routing rules with several named pools, usually from an org variable: config: ${{ vars.ROUTACT_CONFIG }}. See README.'
+    description: 'JSON routing rules with several named pools, usually from the org variable ROUTACT_CONFIG. See README.'
     required: false
   pools:
     description: 'Comma-separated pool names from config to route. Default is every pool.'
