@@ -2,7 +2,7 @@
 #
 #   jobs:
 #     route:
-#       uses: SolZeroAI/routact/.github/workflows/route.yml@master
+#       uses: SolZeroAI/routact/.github/workflows/route.yml@v2
 #       secrets: inherit
 #     build:
 #       needs: route
@@ -16,30 +16,30 @@ on:
   workflow_call:
     inputs:
       config:
-        description: 'JSON routing rules. Default is the ROUTACT_CONFIG variable.'
+        description: "JSON routing rules. Default is the ROUTACT_CONFIG variable."
         type: string
         required: false
       pools:
-        description: 'Comma-separated pool names to route. Default is every pool.'
+        description: "Comma-separated pool names to route. Default is every pool."
         type: string
         required: false
       organization:
-        description: 'Organization whose runners to check. Default is the one in config, else the repository runners.'
+        description: "Organization whose runners to check. Default is the one in config, else the repository runners."
         type: string
         required: false
       claim:
-        description: 'Claim a specific idle runner so concurrent runs never share one. Needs runner write access.'
+        description: "Claim a specific idle runner so concurrent runs never share one. Needs runner write access."
         type: boolean
         default: false
       fallback-on-error:
-        description: 'Use the fallback if the runner check fails'
+        description: "Use the fallback if the runner check fails"
         type: boolean
         default: true
       platform-check:
         type: string
-        default: 'error'
+        default: "error"
       app-id:
-        description: 'GitHub App id. Default is the ROUTACT_APP_ID variable.'
+        description: "GitHub App id. Default is the ROUTACT_APP_ID variable."
         type: string
         required: false
       runs-on:
@@ -50,22 +50,22 @@ on:
       ROUTACT_APP_PRIVATE_KEY:
         required: false
       ROUTACT_TOKEN:
-        description: 'A token to use instead of a GitHub App'
+        description: "A token to use instead of a GitHub App"
         required: false
       ROUTACT_CHECK_TOKEN:
         description: 'Exposed to "command" checks as the ROUTACT_CHECK_TOKEN environment variable'
         required: false
     outputs:
       runners:
-        description: 'JSON object of pool name to label array'
+        description: "JSON object of pool name to label array"
         value: ${{ jobs.route.outputs.runners }}
       use-runner:
-        description: 'JSON label array when exactly one pool is routed'
+        description: "JSON label array when exactly one pool is routed"
         value: ${{ jobs.route.outputs.use-runner }}
       details:
         value: ${{ jobs.route.outputs.details }}
       claims:
-        description: 'Pass to the release input in the job that used the runner'
+        description: "Pass to the release input in the job that used the runner"
         value: ${{ jobs.route.outputs.claims }}
 
 jobs:
@@ -99,7 +99,7 @@ jobs:
 
       - name: Route
         id: route
-        uses: SolZeroAI/routact@master
+        uses: SolZeroAI/routact@v2
         env:
           ROUTACT_CHECK_TOKEN: ${{ secrets.ROUTACT_CHECK_TOKEN }}
         with:

@@ -1,0 +1,133 @@
+name: Validate
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+    branches:
+      - master
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to a pull request cancels its older run. Each master push gets
+# its own group, so no master commit loses its checks.
+concurrency:
+  group: validate-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  validate:
+    name: Lint, format, test, and check dist
+    if: github.event.pull_request.draft != true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup nub
+        uses: nubjs/setup-nub@v0
+        with:
+          nub-version: "0.9.6"
+          node-version-file: .node-version
+          cache-dependency-path: nub.lock
+
+      - name: Install
+        run: nub install --frozen-lockfile
+
+      - name: Lint
+        run: nub run lint
+
+      - name: Check formatting
+        run: nub run format
+
+      - name: Test
+        run: nub run test
+
+      # dist/index.js is what runners execute, so it must match the source.
+      - name: Check dist is up to date
+        run: nub run check-dist
+
+      - name: Upload the expected dist
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          retention-days: 3
+
+  # Runs the built action on the same small runner the route job uses. The
+  # workflow token cannot read runners, so this exercises fallback-on-error.
+  action:
+    name: Run the action
+    if: github.event.pull_request.draft != true
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    outputs:
+      use-runner: ${{ steps.route.outputs.use-runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Route
+        id: route
+        uses: ./
+        with:
+          primary-runner: "self-hosted,Linux,X64"
+          fallback-runner: "ubuntu-24.04"
+          fallback-on-error: true
+          github-token: ${{ secrets.TEST_GITHUB_TOKEN || github.token }}
+
+      - name: Check output
+        env:
+          USE_RUNNER: ${{ steps.route.outputs.use-runner }}
+          REASON: ${{ steps.route.outputs.reason }}
+        run: echo "Runner to use is $USE_RUNNER ($REASON)"
+
+  action-output:
+    name: Run on the routed runner
+    needs: action
+    runs-on: ${{ fromJSON(needs.action.outputs.use-runner) }}
+    timeout-minutes: 5
+    steps:
+      - name: Do something
+        env:
+          USE_RUNNER: ${{ needs.action.outputs.use-runner }}
+        run: echo "Doing something on $USE_RUNNER"
+
+  platform-check:
+    name: Reject a cross-platform fallback
+    if: github.event.pull_request.draft != true
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Route
+        id: mismatch
+        uses: ./
+        continue-on-error: true
+        with:
+          primary-runner: "self-hosted,macOS,ARM64"
+          fallback-runner: "ubuntu-latest"
+          fallback-on-error: true
+          github-token: ${{ github.token }}
+
+      - name: A cross-platform fallback must fail
+        if: steps.mismatch.outcome != 'failure'
+        run: exit 1

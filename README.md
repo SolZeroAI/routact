@@ -1,7 +1,7 @@
 # Routact
 
 <p align="center">
-  <a href="https://github.com/SolZeroAI/routact/actions"><img alt="units-test status" src="https://github.com/SolZeroAI/routact/workflows/units-test/badge.svg"></a>
+  <a href="https://github.com/SolZeroAI/routact/actions/workflows/validate.yml"><img alt="Validate status" src="https://github.com/SolZeroAI/routact/actions/workflows/validate.yml/badge.svg"></a>
 </p>
 
 Route GitHub Actions jobs to your self-hosted runners when they are free, and to a runner of the same OS and CPU architecture when they are not.
@@ -63,7 +63,7 @@ Each pool has `primary` labels, `fallback` labels, and optionally `primaries-req
 ```yaml
 jobs:
   route:
-    uses: SolZeroAI/routact/.github/workflows/route.yml@master
+    uses: SolZeroAI/routact/.github/workflows/route.yml@v2
     secrets: inherit
 
   build:
@@ -197,7 +197,7 @@ jobs:
           private-key: ${{ secrets.ROUTACT_APP_PRIVATE_KEY }}
           permission-organization-self-hosted-runners: read
       - id: route
-        uses: SolZeroAI/routact@master
+        uses: SolZeroAI/routact@v2
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           organization: your-org
@@ -237,7 +237,7 @@ Claims expire after `claim-ttl-minutes` (default 10) and are removed by the next
       - run: make build
       - name: Release runner claim
         if: always() && needs.route.outputs.claims != ''
-        uses: SolZeroAI/routact@master
+        uses: SolZeroAI/routact@v2
         with:
           release: ${{ needs.route.outputs.claims }}
           organization: your-org
@@ -278,7 +278,7 @@ on:
   workflow_dispatch:
 jobs:
   maintain:
-    uses: SolZeroAI/routact/.github/workflows/maintain.yml@master
+    uses: SolZeroAI/routact/.github/workflows/maintain.yml@v2
     secrets: inherit
     with:
       tasks: ${{ github.event.schedule == '17 * * * *' && 'flags' || '' }}
@@ -336,14 +336,22 @@ Routact works out each side's OS and architecture:
 
 If either side cannot be fully determined, Routact warns instead of failing. Add the default OS and architecture labels (for example `Linux,X64`) to your primary labels to make the check exact.
 
+## Versions
+
+Releases follow [semantic versioning](https://semver.org). Each release has a `vX.Y.Z` tag and a GitHub Release with its notes. See [CHANGELOG.md](CHANGELOG.md).
+
+- Pin the major tag, `SolZeroAI/routact@v2` (or `.../route.yml@v2` and `.../maintain.yml@v2`), to get fixes and new features without breaking changes. It moves to each new `v2.x.y` release.
+- Pin an exact tag such as `@v2.0.0`, or a commit SHA, to control every update yourself.
+- `@master` is the development branch. Do not use it in production workflows.
+
 ## Development
 
 ```bash
-npm ci
-npm run all   # lint, build dist/, test
+nub install --frozen-lockfile
+nub run check   # lint, format, test, build dist/
 ```
 
-`dist/` is checked in because Actions runs it directly; rebuild it with `npm run prepare` before committing.
+`dist/` is checked in because Actions runs it directly. Rebuild it with `nub run build` and commit it with the source change. See [CONTRIBUTING.md](CONTRIBUTING.md) for the release process.
 
 ## Credit
 

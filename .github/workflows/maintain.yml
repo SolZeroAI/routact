@@ -7,7 +7,7 @@
 #       - cron: '23 6 * * *'   # daily: everything
 #   jobs:
 #     maintain:
-#       uses: SolZeroAI/routact/.github/workflows/maintain.yml@master
+#       uses: SolZeroAI/routact/.github/workflows/maintain.yml@v2
 #       secrets: inherit
 #       with:
 #         tasks: ${{ github.event.schedule == '17 * * * *' && 'flags' || '' }}
@@ -21,23 +21,23 @@ on:
   workflow_call:
     inputs:
       tasks:
-        description: 'Comma-separated tasks: validate, images, flags. Default is all.'
+        description: "Comma-separated tasks: validate, images, flags. Default is all."
         type: string
         required: false
       flags:
-        description: 'JSON object of variable name to command. Default is the ROUTACT_FLAGS variable.'
+        description: "JSON object of variable name to command. Default is the ROUTACT_FLAGS variable."
         type: string
         required: false
       apply-upgrades:
-        description: 'Write newer GitHub-hosted image labels into ROUTACT_CONFIG instead of only suggesting them'
+        description: "Write newer GitHub-hosted image labels into ROUTACT_CONFIG instead of only suggesting them"
         type: boolean
         default: false
       organization:
-        description: 'Default is the organization in ROUTACT_CONFIG, else the repository owner'
+        description: "Default is the organization in ROUTACT_CONFIG, else the repository owner"
         type: string
         required: false
       app-id:
-        description: 'GitHub App id. Default is the ROUTACT_APP_ID variable.'
+        description: "GitHub App id. Default is the ROUTACT_APP_ID variable."
         type: string
         required: false
       runs-on:
@@ -48,10 +48,10 @@ on:
       ROUTACT_APP_PRIVATE_KEY:
         required: false
       ROUTACT_TOKEN:
-        description: 'A token to use instead of a GitHub App'
+        description: "A token to use instead of a GitHub App"
         required: false
       ROUTACT_CHECK_TOKEN:
-        description: 'Exposed to flag commands as the ROUTACT_CHECK_TOKEN environment variable'
+        description: "Exposed to flag commands as the ROUTACT_CHECK_TOKEN environment variable"
         required: false
     outputs:
       problems:
@@ -81,7 +81,7 @@ jobs:
 
       - name: Maintain
         id: maintain
-        uses: SolZeroAI/routact@master
+        uses: SolZeroAI/routact@v2
         env:
           ROUTACT_CHECK_TOKEN: ${{ secrets.ROUTACT_CHECK_TOKEN }}
         with:

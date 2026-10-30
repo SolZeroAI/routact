@@ -4,13 +4,16 @@ name: SolZeroAI Routact maintenance
 
 on:
   schedule:
-    - cron: '17 * * * *'   # hourly: flags only
-    - cron: '23 6 * * *'   # daily: validate config, review images, flags
+    - cron: "17 * * * *" # hourly: flags only
+    - cron: "23 6 * * *" # daily: validate config, review images, flags
   workflow_dispatch:
     inputs:
       tasks:
-        description: 'Comma-separated tasks (validate, images, flags); empty runs all'
+        description: "Comma-separated tasks (validate, images, flags); empty runs all"
         required: false
+
+permissions:
+  contents: read
 
 jobs:
   maintain:

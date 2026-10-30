@@ -1,27 +1,27 @@
-name: 'Routact'
-description: 'Route jobs to idle self-hosted runners, falling back to a runner of the same platform when none are free'
-author: 'SolZeroAI'
+name: "Routact"
+description: "Route jobs to idle self-hosted runners, falling back to a runner of the same platform when none are free"
+author: "SolZeroAI"
 branding:
   icon: shuffle
   color: blue
 inputs:
   github-token:
-    description: 'Token that can read self-hosted runners for the chosen scope. A GitHub App installation token is recommended (see README). Not needed for fork pull requests, which always fall back.'
+    description: "Token that can read self-hosted runners for the chosen scope. A GitHub App installation token is recommended (see README). Not needed for fork pull requests, which always fall back."
     required: false
   primary-runner:
-    description: 'Comma-separated labels for the primary runner, e.g. self-hosted,Linux,X64. Use with fallback-runner, or use config instead.'
+    description: "Comma-separated labels for the primary runner, e.g. self-hosted,Linux,X64. Use with fallback-runner, or use config instead."
     required: false
   fallback-runner:
-    description: 'Comma-separated labels for the fallback runner, e.g. ubuntu-24.04. For an ordered list of fallbacks with conditions, use config.'
+    description: "Comma-separated labels for the fallback runner, e.g. ubuntu-24.04. For an ordered list of fallbacks with conditions, use config."
     required: false
   primaries-required:
-    description: 'Fall back unless at least this many matching primaries are online and idle. When empty, any online primary is enough, busy or not.'
+    description: "Fall back unless at least this many matching primaries are online and idle. When empty, any online primary is enough, busy or not."
     required: false
   config:
-    description: 'JSON routing rules with several named pools, usually from the org variable ROUTACT_CONFIG. See README.'
+    description: "JSON routing rules with several named pools, usually from the org variable ROUTACT_CONFIG. See README."
     required: false
   pools:
-    description: 'Comma-separated pool names from config to route. Default is every pool.'
+    description: "Comma-separated pool names from config to route. Default is every pool."
     required: false
   vars:
     description: 'Variables for "var" checks in fallback steps, as JSON. Pass toJSON(vars) inside an expression.'
@@ -29,71 +29,71 @@ inputs:
   check-timeout-seconds:
     description: 'Time limit for each "command" check in fallback steps'
     required: false
-    default: '20'
+    default: "20"
   organization:
-    description: 'Organization whose runners to check (mutually exclusive with enterprise). Default is the repository runners.'
+    description: "Organization whose runners to check (mutually exclusive with enterprise). Default is the repository runners."
     required: false
   enterprise:
-    description: 'Enterprise whose runners to check (mutually exclusive with organization)'
+    description: "Enterprise whose runners to check (mutually exclusive with organization)"
     required: false
   fallback-on-error:
-    description: 'Use the fallback if checking runners fails, for example on an expired token or a GitHub API outage. Configuration errors still fail.'
+    description: "Use the fallback if checking runners fails, for example on an expired token or a GitHub API outage. Configuration errors still fail."
     required: false
-    default: 'false'
+    default: "false"
   fallback-on-fork-pr:
-    description: 'Never use self-hosted runners for pull requests from forks: skip the primary and any self-hosted fallback step, without calling the API'
+    description: "Never use self-hosted runners for pull requests from forks: skip the primary and any self-hosted fallback step, without calling the API"
     required: false
-    default: 'true'
+    default: "true"
   platform-check:
-    description: 'What to do when a fallback does not match the primary OS and CPU architecture: error, warn or off'
+    description: "What to do when a fallback does not match the primary OS and CPU architecture: error, warn or off"
     required: false
-    default: 'error'
+    default: "error"
   claim:
-    description: 'Claim a specific idle runner with a unique label so concurrent runs never pick the same one. Needs write access to self-hosted runners. See README.'
+    description: "Claim a specific idle runner with a unique label so concurrent runs never pick the same one. Needs write access to self-hosted runners. See README."
     required: false
-    default: 'false'
+    default: "false"
   claim-ttl-minutes:
-    description: 'Minutes after which an unreleased claim expires and is removed'
+    description: "Minutes after which an unreleased claim expires and is removed"
     required: false
-    default: '10'
+    default: "10"
   release:
-    description: 'Release claims instead of routing: pass the claims output of the routing step'
+    description: "Release claims instead of routing: pass the claims output of the routing step"
     required: false
   mode:
     description: 'route (default) or maintain: validate config, review GitHub-hosted images and update flag variables. See README, "Maintenance".'
     required: false
-    default: 'route'
+    default: "route"
   tasks:
-    description: 'Maintenance tasks to run, comma-separated: validate, images, flags. Default is all.'
+    description: "Maintenance tasks to run, comma-separated: validate, images, flags. Default is all."
     required: false
   flags:
     description: 'Maintenance: JSON object of org variable name to shell command. The variable is set to "true" when the command exits 0, else "false".'
     required: false
   apply-upgrades:
-    description: 'Maintenance: write newer GitHub-hosted image labels into ROUTACT_CONFIG instead of only suggesting them'
+    description: "Maintenance: write newer GitHub-hosted image labels into ROUTACT_CONFIG instead of only suggesting them"
     required: false
-    default: 'false'
+    default: "false"
 outputs:
   use-runner:
-    description: 'JSON label array for runs-on, read with fromJson. Set when exactly one pool is routed.'
+    description: "JSON label array for runs-on, read with fromJson. Set when exactly one pool is routed."
   is-primary:
     description: '"true" when the primary was chosen. Set when exactly one pool is routed.'
   fallback-step:
-    description: 'Which fallback step was used, counting from 1; 0 when the primary was chosen. Set when exactly one pool is routed.'
+    description: "Which fallback step was used, counting from 1; 0 when the primary was chosen. Set when exactly one pool is routed."
   runner-name:
-    description: 'Name of the chosen runner, when known (always known with claim). Set when exactly one pool is routed.'
+    description: "Name of the chosen runner, when known (always known with claim). Set when exactly one pool is routed."
   reason:
-    description: 'Why this runner was chosen. Set when exactly one pool is routed.'
+    description: "Why this runner was chosen. Set when exactly one pool is routed."
   runners:
     description: 'JSON object of pool name to label array, e.g. fromJson(needs.route.outputs.runners)[''linux-arm'']. Single-pool inputs use the pool name "default".'
   details:
-    description: 'JSON object of pool name to {labels, isPrimary, fallbackStep, runnerName, claim, reason}'
+    description: "JSON object of pool name to {labels, isPrimary, fallbackStep, runnerName, claim, reason}"
   claims:
-    description: 'Comma-separated claims made by this run, to pass to release'
+    description: "Comma-separated claims made by this run, to pass to release"
   problems:
-    description: 'Maintenance: number of problems found'
+    description: "Maintenance: number of problems found"
   suggested-config:
-    description: 'Maintenance: ROUTACT_CONFIG with newer GitHub-hosted image labels, when there are any'
+    description: "Maintenance: ROUTACT_CONFIG with newer GitHub-hosted image labels, when there are any"
 runs:
-  using: 'node24'
-  main: 'dist/index.js'
+  using: "node24"
+  main: "dist/index.js"
