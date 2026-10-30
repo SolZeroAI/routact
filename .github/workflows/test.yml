@@ -10,7 +10,7 @@ jobs:
   units:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
     - uses: actions/setup-node@v5
       with:
         node-version: 24
@@ -25,7 +25,7 @@ jobs:
     outputs:
       use-runner: ${{ steps.test-action.outputs.use-runner }}
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
     - id: test-action
       uses: ./
       with:
@@ -46,7 +46,7 @@ jobs:
   test-platform-check:
     runs-on: ubuntu-slim
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
     - id: mismatch
       uses: ./
       continue-on-error: true
