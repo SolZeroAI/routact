@@ -28,11 +28,14 @@ Routact started as a fork of [mikehardy/runner-fallback-action](https://github.c
 
 Create a GitHub App owned by your organization (Settings → Developer settings → GitHub Apps) with:
 
-| Runners you check | App permission |
+| Needed for | App permission |
 | --- | --- |
-| Organization runners | Organization → **Self-hosted runners: Read** (Read and write for claims) |
+| Routing with organization runners | Organization → **Self-hosted runners: Read** (Read and write for claims) |
+| Routing with repository runners | Repository → **Administration: Read** (Read and write for claims) |
 | `github-minutes` checks | Organization → **Administration: Read** |
-| Repository runners | Repository → **Administration: Read** (Read and write for claims) |
+| [Maintenance](#maintenance) flags and `apply-upgrades` | Organization → **Variables: Read and write** |
+
+After changing an installed App's permissions, an org owner must accept them on the installation (Settings → GitHub Apps → the App → Review request) before tokens include them.
 
 No webhook is needed. Install the App on the organization, then save its id as the org variable `ROUTACT_APP_ID` and its private key as the org secret `ROUTACT_APP_PRIVATE_KEY`.
 
