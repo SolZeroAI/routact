@@ -14,9 +14,10 @@ Routact started as a fork of [mikehardy/runner-fallback-action](https://github.c
 
 - **Bug fixes.** Busy runners were always skipped even without `primaries-required`; only the first 30 runners were read; a multi-label fallback broke on errors; labels were matched case-sensitively.
 - **GitHub App tokens** instead of an org-admin personal access token.
-- **Fork pull requests always use the fallback**, without calling the API. They get no secrets anyway, and running untrusted code on self-hosted runners is unsafe.
+- **Fork pull requests never use self-hosted runners**, and no API call is made for them. They get no secrets anyway, and running untrusted code on self-hosted runners is unsafe.
 - **Same-platform fallback.** Routact refuses a fallback whose OS or architecture differs from the primary (for example a Mac pool falling back to `ubuntu-latest`).
 - **Several pools in one call**, with shared rules kept in one org variable.
+- **Fallback chains** (self-hosted, then Blacksmith, then GitHub-hosted, for example), where each step can have conditions: built-in checks or your own command.
 - **Runner claims**, an opt-in lock that stops two concurrent runs from picking the same idle runner.
 - **A reusable route job** on `ubuntu-slim`, the smallest and fastest-starting GitHub-hosted runner.
 - `node24`, retries and timeouts on API calls, and a job summary table.
@@ -75,6 +76,68 @@ jobs:
 ```
 
 One route job serves every pool in the workflow with a single API call.
+
+## Fallback chains
+
+A pool's `fallback` can be an ordered list of steps instead of one label set. Routact uses the first step whose checks all pass:
+
+```json
+{
+  "pools": {
+    "linux-x64": {
+      "primary": "self-hosted,Linux,X64",
+      "fallback": [
+        { "runs-on": "self-hosted,Linux,X64,spare", "when": "idle" },
+        { "runs-on": "blacksmith-4vcpu-ubuntu-2404", "when": { "var": "ROUTACT_BLACKSMITH_ENABLED" } },
+        { "runs-on": "ubuntu-24.04" }
+      ]
+    }
+  }
+}
+```
+
+Leave the last step without conditions so there is always somewhere to run. If every step has conditions and all of them fail, Routact uses the last step anyway and says so in the summary.
+
+### Checks
+
+`when` takes one check or a list of checks that must all pass.
+
+| Check | Passes when |
+| --- | --- |
+| `"idle"` | An online, idle self-hosted runner has the step's labels. `{"idle": 2}` needs two. |
+| `{"var": "NAME"}` | The Actions variable `NAME` is set and not `false`, `0`, `no` or `off`. Add `"equals": "value"` to compare exactly. Needs the `vars` input (the reusable workflow passes it). |
+| `{"env": "NAME"}` | The environment variable `NAME` is set and truthy. Same options as `var`. |
+| `{"command": "..."}` | The shell command exits 0. Use this for your own logic. |
+| `{"not": check}` | The inner check fails. |
+| `{"any": [checks]}` | At least one inner check passes. |
+
+### Your own logic
+
+A `command` check runs with `bash` in the route job and has `check-timeout-seconds` (default 20) to finish. A command that fails, times out or cannot start counts as a failed check. It sees these environment variables:
+
+- `ROUTACT_POOL`: the pool name.
+- `ROUTACT_RUNS_ON`: the step's labels as a JSON array.
+- `ROUTACT_CHECK_TOKEN`: the `ROUTACT_CHECK_TOKEN` secret, when you use the reusable workflow.
+
+For example, ask your own service whether a provider still has budget:
+
+```json
+{ "runs-on": "blacksmith-4vcpu-ubuntu-2404",
+  "when": { "command": "curl -fsS -H \"Authorization: Bearer $ROUTACT_CHECK_TOKEN\" https://ci-budget.example.com/blacksmith/ok" } }
+```
+
+The route job does not check out your repository, so a command cannot run scripts from it unless you call the action yourself after `actions/checkout`. Commands come from your config, never from pull request code.
+
+### Blacksmith minutes
+
+Each check adds time to every route job, so keep slow checks out of it. For Blacksmith, the fast pattern is a variable flag:
+
+1. Gate the Blacksmith step on `{"var": "ROUTACT_BLACKSMITH_ENABLED"}`.
+2. Set the org variable to `false` when the month's minutes run out, and back to `true` when they reset. You can do it by hand, or with a scheduled workflow that runs the [Blacksmith CLI](https://docs.blacksmith.sh/blacksmith-cli/usage) (`blacksmith usage`) and updates the variable with `gh variable set`.
+
+### Fork pull requests
+
+Fork PRs skip the primary and every fallback step labelled `self-hosted`. Other checks still run, so a fork PR can use Blacksmith when it is enabled.
 
 ## Using the action directly
 
@@ -154,14 +217,16 @@ Things to know:
 | --- | --- | --- |
 | `github-token` | | Token that can read runners for the chosen scope. Not needed for fork PRs. |
 | `primary-runner` | | Comma-separated labels of the primary runner, e.g. `self-hosted,Linux,X64`. Use with `fallback-runner`, or use `config`. |
-| `fallback-runner` | | Comma-separated labels of the fallback, e.g. `ubuntu-24.04`. |
+| `fallback-runner` | | Comma-separated labels of the fallback, e.g. `ubuntu-24.04`. Use `config` for a [fallback chain](#fallback-chains). |
 | `primaries-required` | | Fall back unless at least this many matching primaries are online **and idle**. Empty means any online primary is enough, even a busy one. |
 | `config` | | JSON routing rules with named pools (see Quick start). |
 | `pools` | all | Comma-separated pool names from `config` to route. |
+| `vars` | | Variables for `var` checks: `${{ toJSON(vars) }}`. |
+| `check-timeout-seconds` | `20` | Time limit for each `command` check. |
 | `organization` | | Check this organization's runners. Default is the repository's runners, or the `organization` in `config`. |
 | `enterprise` | | Check this enterprise's runners. |
 | `fallback-on-error` | `false` | Use the fallback if the runner check fails (expired token, API outage). Configuration errors still fail the job. |
-| `fallback-on-fork-pr` | `true` | Always use the fallback for pull requests from forks. |
+| `fallback-on-fork-pr` | `true` | Never use self-hosted runners for pull requests from forks. |
 | `platform-check` | `error` | When the fallback's OS or architecture differs from the primary: `error`, `warn` or `off`. |
 | `claim` | `false` | Claim a specific idle runner (see [Runner claims](#runner-claims)). |
 | `claim-ttl-minutes` | `10` | Minutes before an unreleased claim expires. |
@@ -173,10 +238,11 @@ Things to know:
 | --- | --- |
 | `use-runner` | JSON label array for `runs-on`, read with `fromJson`. Set when exactly one pool is routed. |
 | `is-primary` | `true` when the primary was chosen (single pool). |
+| `fallback-step` | Which fallback step was used, counting from 1; `0` for the primary (single pool). |
 | `runner-name` | The chosen runner's name, when known (single pool). |
 | `reason` | Why this runner was chosen (single pool). |
 | `runners` | JSON object of pool name to label array. The single-pool inputs use the pool name `default`. |
-| `details` | JSON object of pool name to `{labels, isPrimary, runnerName, claim, reason}`. |
+| `details` | JSON object of pool name to `{labels, isPrimary, fallbackStep, runnerName, claim, reason}`. |
 | `claims` | Comma-separated claims made by this run, for `release`. |
 
 ## How the platform check works

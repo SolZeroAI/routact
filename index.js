@@ -3,6 +3,7 @@ const { RunnerClient, apiPathFor } = require('./src/github');
 const { parseConfig, resolvePools } = require('./src/config');
 const { isForkPullRequest } = require('./src/event');
 const { ConfigError, routePools, fallbackResults, parseClaims } = require('./src/route');
+const { parseVars } = require('./src/checks');
 
 const PLATFORM_CHECKS = ['error', 'warn', 'off'];
 
@@ -16,8 +17,17 @@ function readInputs() {
   if (!(claimTtlMinutes > 0)) {
     throw new ConfigError(`claim-ttl-minutes must be a positive number, got "${core.getInput('claim-ttl-minutes')}"`);
   }
+  const checkTimeoutSeconds = Number(core.getInput('check-timeout-seconds') || 20);
+  if (!(checkTimeoutSeconds > 0)) {
+    throw new ConfigError(`check-timeout-seconds must be a positive number, got "${core.getInput('check-timeout-seconds')}"`);
+  }
   return {
     token: core.getInput('github-token'),
+    checkContext: {
+      vars: parseVars(core.getInput('vars')),
+      timeoutSeconds: checkTimeoutSeconds,
+      log: (message) => core.info(message),
+    },
     organization: core.getInput('organization') || (config && config.organization),
     enterprise: core.getInput('enterprise') || (config && config.enterprise),
     pools: resolvePools({
@@ -60,6 +70,7 @@ function writeOutputs(results) {
     const result = results[names[0]];
     core.setOutput('use-runner', JSON.stringify(result.labels));
     core.setOutput('is-primary', String(result.isPrimary));
+    core.setOutput('fallback-step', String(result.fallbackStep));
     core.setOutput('runner-name', result.runnerName);
     core.setOutput('reason', result.reason);
   }
@@ -74,7 +85,7 @@ async function writeSummary(results) {
   const rows = Object.entries(results).map(([name, result]) => [
     name,
     result.labels.join(', '),
-    result.isPrimary ? 'primary' : 'fallback',
+    result.isPrimary ? 'primary' : `fallback ${result.fallbackStep}`,
     result.reason,
   ]);
   await core.summary
@@ -119,7 +130,13 @@ async function route() {
     eventPath: process.env.GITHUB_EVENT_PATH,
     repository: process.env.GITHUB_REPOSITORY,
   })) {
-    results = fallbackResults(inputs.pools, 'pull request from a fork always uses the fallback');
+    try {
+      results = await fallbackResults(inputs.pools, 'pull request from a fork always uses the fallback',
+        { skipSelfHosted: true, checkContext: inputs.checkContext });
+    } catch (error) {
+      core.setFailed(error.message);
+      return;
+    }
   } else {
     try {
       results = await routePools({
@@ -132,6 +149,7 @@ async function route() {
         attempt: process.env.GITHUB_RUN_ATTEMPT,
         log: (message) => core.info(message),
         warn: (message) => core.warning(message),
+        checkContext: inputs.checkContext,
       });
     } catch (error) {
       if (error instanceof ConfigError || !inputs.fallbackOnError) {
@@ -140,7 +158,8 @@ async function route() {
       }
       core.warning('Checking for available runners failed, but fallback-on-error is true');
       core.warning(`Original error: ${error.message}`);
-      results = fallbackResults(inputs.pools, `error while checking runners: ${error.message}`);
+      results = await fallbackResults(inputs.pools, `error while checking runners: ${error.message}`,
+        { checkContext: inputs.checkContext });
     }
   }
 

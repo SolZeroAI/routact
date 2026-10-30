@@ -12,7 +12,7 @@ inputs:
     description: 'Comma-separated labels for the primary runner, e.g. self-hosted,Linux,X64. Use with fallback-runner, or use config instead.'
     required: false
   fallback-runner:
-    description: 'Comma-separated labels for the fallback runner, e.g. ubuntu-24.04'
+    description: 'Comma-separated labels for the fallback runner, e.g. ubuntu-24.04. For an ordered list of fallbacks with conditions, use config.'
     required: false
   primaries-required:
     description: 'Fall back unless at least this many matching primaries are online and idle. When empty, any online primary is enough, busy or not.'
@@ -23,6 +23,13 @@ inputs:
   pools:
     description: 'Comma-separated pool names from config to route. Default is every pool.'
     required: false
+  vars:
+    description: 'Variables for "var" checks in fallback steps, as JSON. Pass toJSON(vars) inside an expression.'
+    required: false
+  check-timeout-seconds:
+    description: 'Time limit for each "command" check in fallback steps'
+    required: false
+    default: '20'
   organization:
     description: 'Organization whose runners to check (mutually exclusive with enterprise). Default is the repository runners.'
     required: false
@@ -34,7 +41,7 @@ inputs:
     required: false
     default: 'false'
   fallback-on-fork-pr:
-    description: 'Always use the fallback for pull requests from forks, without calling the API'
+    description: 'Never use self-hosted runners for pull requests from forks: skip the primary and any self-hosted fallback step, without calling the API'
     required: false
     default: 'true'
   platform-check:
@@ -57,6 +64,8 @@ outputs:
     description: 'JSON label array for runs-on, read with fromJson. Set when exactly one pool is routed.'
   is-primary:
     description: '"true" when the primary was chosen. Set when exactly one pool is routed.'
+  fallback-step:
+    description: 'Which fallback step was used, counting from 1; 0 when the primary was chosen. Set when exactly one pool is routed.'
   runner-name:
     description: 'Name of the chosen runner, when known (always known with claim). Set when exactly one pool is routed.'
   reason:
@@ -64,7 +73,7 @@ outputs:
   runners:
     description: 'JSON object of pool name to label array, e.g. fromJson(needs.route.outputs.runners)[''linux-arm'']. Single-pool inputs use the pool name "default".'
   details:
-    description: 'JSON object of pool name to {labels, isPrimary, runnerName, claim, reason}'
+    description: 'JSON object of pool name to {labels, isPrimary, fallbackStep, runnerName, claim, reason}'
   claims:
     description: 'Comma-separated claims made by this run, to pass to release'
 runs:

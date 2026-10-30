@@ -9,6 +9,7 @@ const { RunnerClient, apiPathFor } = __nccwpck_require__(6474);
 const { parseConfig, resolvePools } = __nccwpck_require__(1283);
 const { isForkPullRequest } = __nccwpck_require__(4281);
 const { ConfigError, routePools, fallbackResults, parseClaims } = __nccwpck_require__(1904);
+const { parseVars } = __nccwpck_require__(1680);
 
 const PLATFORM_CHECKS = ['error', 'warn', 'off'];
 
@@ -22,8 +23,17 @@ function readInputs() {
   if (!(claimTtlMinutes > 0)) {
     throw new ConfigError(`claim-ttl-minutes must be a positive number, got "${core.getInput('claim-ttl-minutes')}"`);
   }
+  const checkTimeoutSeconds = Number(core.getInput('check-timeout-seconds') || 20);
+  if (!(checkTimeoutSeconds > 0)) {
+    throw new ConfigError(`check-timeout-seconds must be a positive number, got "${core.getInput('check-timeout-seconds')}"`);
+  }
   return {
     token: core.getInput('github-token'),
+    checkContext: {
+      vars: parseVars(core.getInput('vars')),
+      timeoutSeconds: checkTimeoutSeconds,
+      log: (message) => core.info(message),
+    },
     organization: core.getInput('organization') || (config && config.organization),
     enterprise: core.getInput('enterprise') || (config && config.enterprise),
     pools: resolvePools({
@@ -66,6 +76,7 @@ function writeOutputs(results) {
     const result = results[names[0]];
     core.setOutput('use-runner', JSON.stringify(result.labels));
     core.setOutput('is-primary', String(result.isPrimary));
+    core.setOutput('fallback-step', String(result.fallbackStep));
     core.setOutput('runner-name', result.runnerName);
     core.setOutput('reason', result.reason);
   }
@@ -80,7 +91,7 @@ async function writeSummary(results) {
   const rows = Object.entries(results).map(([name, result]) => [
     name,
     result.labels.join(', '),
-    result.isPrimary ? 'primary' : 'fallback',
+    result.isPrimary ? 'primary' : `fallback ${result.fallbackStep}`,
     result.reason,
   ]);
   await core.summary
@@ -125,7 +136,13 @@ async function route() {
     eventPath: process.env.GITHUB_EVENT_PATH,
     repository: process.env.GITHUB_REPOSITORY,
   })) {
-    results = fallbackResults(inputs.pools, 'pull request from a fork always uses the fallback');
+    try {
+      results = await fallbackResults(inputs.pools, 'pull request from a fork always uses the fallback',
+        { skipSelfHosted: true, checkContext: inputs.checkContext });
+    } catch (error) {
+      core.setFailed(error.message);
+      return;
+    }
   } else {
     try {
       results = await routePools({
@@ -138,6 +155,7 @@ async function route() {
         attempt: process.env.GITHUB_RUN_ATTEMPT,
         log: (message) => core.info(message),
         warn: (message) => core.warning(message),
+        checkContext: inputs.checkContext,
       });
     } catch (error) {
       if (error instanceof ConfigError || !inputs.fallbackOnError) {
@@ -146,7 +164,8 @@ async function route() {
       }
       core.warning('Checking for available runners failed, but fallback-on-error is true');
       core.warning(`Original error: ${error.message}`);
-      results = fallbackResults(inputs.pools, `error while checking runners: ${error.message}`);
+      results = await fallbackResults(inputs.pools, `error while checking runners: ${error.message}`,
+        { checkContext: inputs.checkContext });
     }
   }
 
@@ -54847,10 +54866,153 @@ module.exports = {
 
 /***/ }),
 
+/***/ 1680:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+const { spawn } = __nccwpck_require__(5317);
+const { ConfigError } = __nccwpck_require__(438);
+
+// Conditions on a fallback step. A step's `when` is one check or a list of
+// checks that must all pass:
+//   "idle"                          an online, idle runner has the step's labels
+//   {"idle": 2}                     at least 2 such runners
+//   {"var": "NAME"}                 org/repo variable NAME is truthy (needs the vars input)
+//   {"var": "NAME", "equals": "x"}  variable NAME is exactly "x"
+//   {"env": "NAME"}                 environment variable NAME is truthy (same options as var)
+//   {"command": "..."}              shell command exits 0, for your own logic
+//   {"not": <check>}                the inner check fails
+//   {"any": [<check>, ...]}         at least one inner check passes
+
+const FALSY = ['', '0', 'false', 'no', 'off'];
+const DEFAULT_COMMAND_TIMEOUT_SECONDS = 20;
+
+function validate(check, where) {
+  if (check === 'idle') return;
+  if (!check || typeof check !== 'object' || Array.isArray(check)) {
+    throw new ConfigError(`${where}: unknown check ${JSON.stringify(check)}`);
+  }
+  const kinds = ['idle', 'var', 'env', 'command', 'not', 'any'].filter((kind) => kind in check);
+  if (kinds.length !== 1) {
+    throw new ConfigError(`${where}: a check needs exactly one of idle, var, env, command, not, any; got ${JSON.stringify(check)}`);
+  }
+  if (check.not !== undefined) validate(check.not, where);
+  if (check.any !== undefined) {
+    if (!Array.isArray(check.any) || check.any.length === 0) throw new ConfigError(`${where}: "any" needs a list of checks`);
+    check.any.forEach((inner) => validate(inner, where));
+  }
+  if (check.idle !== undefined && !(Number.isInteger(check.idle) && check.idle >= 1)) {
+    throw new ConfigError(`${where}: "idle" needs a whole number of at least 1`);
+  }
+  for (const key of ['var', 'env', 'command']) {
+    if (check[key] !== undefined && (typeof check[key] !== 'string' || !check[key].trim())) {
+      throw new ConfigError(`${where}: "${key}" needs a non-empty string`);
+    }
+  }
+}
+
+function normalizeWhen(when, where) {
+  if (when === undefined || when === null) return [];
+  const list = Array.isArray(when) ? when : [when];
+  list.forEach((check) => validate(check, where));
+  return list;
+}
+
+function compareValue(value, check) {
+  if (check.equals !== undefined) return String(value === undefined ? '' : value) === String(check.equals);
+  return value !== undefined && value !== null && !FALSY.includes(String(value).trim().toLowerCase());
+}
+
+function describe(check) {
+  if (check === 'idle') return 'idle runner';
+  if (check.idle !== undefined) return `${check.idle} idle runners`;
+  if (check.var !== undefined) return `var ${check.var}`;
+  if (check.env !== undefined) return `env ${check.env}`;
+  if (check.command !== undefined) return 'command';
+  if (check.not !== undefined) return `not ${describe(check.not)}`;
+  return `any of ${check.any.map(describe).join(', ')}`;
+}
+
+// Runs a shell command; resolves true on exit code 0. Never rejects: a
+// command that cannot start or times out counts as a failed check.
+function runCommand(command, { env = {}, timeoutSeconds = DEFAULT_COMMAND_TIMEOUT_SECONDS, log = () => {} } = {}) {
+  return new Promise((resolve) => {
+    const child = spawn('bash', ['-c', command], {
+      env: { ...process.env, ...env },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let output = '';
+    const collect = (chunk) => { output += chunk; };
+    child.stdout.on('data', collect);
+    child.stderr.on('data', collect);
+    const timer = setTimeout(() => {
+      log(`Check command timed out after ${timeoutSeconds}s`);
+      child.kill('SIGKILL');
+    }, timeoutSeconds * 1000);
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      log(`Check command could not start: ${error.message}`);
+      resolve(false);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (output.trim()) log(output.trim());
+      resolve(code === 0);
+    });
+  });
+}
+
+// context: {idleCount(labels), vars, env, commandEnv, timeoutSeconds, log, run}
+async function evaluate(check, step, context) {
+  if (check === 'idle') return context.idleCount(step.labels) >= 1;
+  if (check.idle !== undefined) return context.idleCount(step.labels) >= check.idle;
+  if (check.var !== undefined) return compareValue((context.vars || {})[check.var], check);
+  if (check.env !== undefined) return compareValue((context.env || process.env)[check.env], check);
+  if (check.not !== undefined) return !(await evaluate(check.not, step, context));
+  if (check.any !== undefined) {
+    for (const inner of check.any) {
+      if (await evaluate(inner, step, context)) return true;
+    }
+    return false;
+  }
+  const run = context.run || runCommand;
+  return run(check.command, {
+    env: { ...context.commandEnv, ROUTACT_RUNS_ON: JSON.stringify(step.labels) },
+    timeoutSeconds: context.timeoutSeconds,
+    log: context.log,
+  });
+}
+
+// Returns {passed, failed} where failed names the first check that failed
+async function evaluateAll(step, context) {
+  for (const check of step.when) {
+    if (!(await evaluate(check, step, context))) {
+      return { passed: false, failed: describe(check) };
+    }
+  }
+  return { passed: true };
+}
+
+function parseVars(text) {
+  if (!text || !String(text).trim()) return {};
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    throw new ConfigError('vars must be JSON, e.g. vars: ${{ toJSON(vars) }}');
+  }
+}
+
+module.exports = { normalizeWhen, evaluate, evaluateAll, describe, runCommand, parseVars };
+
+
+/***/ }),
+
 /***/ 1283:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-const { ConfigError, parseLabels, parseCount } = __nccwpck_require__(1904);
+const { ConfigError } = __nccwpck_require__(438);
+const { parseLabels, parseCount } = __nccwpck_require__(1904);
+const { normalizeWhen } = __nccwpck_require__(1680);
 
 const DEFAULT_POOL = 'default';
 
@@ -54858,7 +55020,14 @@ const DEFAULT_POOL = 'default';
 // {
 //   "organization": "my-org",
 //   "pools": {
-//     "linux-arm": { "primary": "self-hosted,Linux,ARM64", "fallback": "ubuntu-24.04-arm", "primaries-required": 1 }
+//     "linux-arm": { "primary": "self-hosted,Linux,ARM64", "fallback": "ubuntu-24.04-arm", "primaries-required": 1 },
+//     "linux-x64": {
+//       "primary": "self-hosted,Linux,X64",
+//       "fallback": [
+//         { "runs-on": "blacksmith-4vcpu-ubuntu-2404", "when": { "var": "ROUTACT_BLACKSMITH_ENABLED" } },
+//         { "runs-on": "ubuntu-24.04" }
+//       ]
+//     }
 //   }
 // }
 // A bare object of pools (without the "pools" key) is accepted too.
@@ -54893,12 +55062,32 @@ function parsePool(name, value) {
   const pool = {
     name,
     primary: parseLabels(value.primary),
-    fallback: parseLabels(value.fallback),
+    fallbacks: parseFallbacks(value.fallback, `Pool "${name}"`),
     primariesRequired: parseCount(value['primaries-required'], `Pool "${name}" primaries-required`),
   };
   if (pool.primary.length === 0) throw new ConfigError(`Pool "${name}" has no primary labels`);
-  if (pool.fallback.length === 0) throw new ConfigError(`Pool "${name}" has no fallback labels`);
   return pool;
+}
+
+// "fallback" is either labels (a string or list of strings) for one step, or
+// an ordered list of steps: {"runs-on": labels, "when": check or [checks]}
+function parseFallbacks(value, where) {
+  const isChain = Array.isArray(value) && value.some((entry) => entry && typeof entry === 'object');
+  if (!isChain) {
+    const labels = parseLabels(value);
+    if (labels.length === 0) throw new ConfigError(`${where} has no fallback labels`);
+    return [{ labels, when: [] }];
+  }
+  if (value.length === 0) throw new ConfigError(`${where} has no fallback labels`);
+  return value.map((entry, index) => {
+    const stepWhere = `${where} fallback step ${index + 1}`;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new ConfigError(`${stepWhere} must be an object with "runs-on"`);
+    }
+    const labels = parseLabels(entry['runs-on']);
+    if (labels.length === 0) throw new ConfigError(`${stepWhere} has no "runs-on" labels`);
+    return { labels, when: normalizeWhen(entry.when, stepWhere) };
+  });
 }
 
 function omit(object, keys) {
@@ -54915,7 +55104,7 @@ function resolvePools({ primaryRunner, fallbackRunner, primariesRequired, config
     return [{
       name: DEFAULT_POOL,
       primary: parseLabels(primaryRunner),
-      fallback: parseLabels(fallbackRunner),
+      fallbacks: parseFallbacks(fallbackRunner, 'fallback-runner'),
       primariesRequired: parseCount(primariesRequired),
     }];
   }
@@ -54934,7 +55123,24 @@ function resolvePools({ primaryRunner, fallbackRunner, primariesRequired, config
   });
 }
 
-module.exports = { DEFAULT_POOL, parseConfig, resolvePools };
+module.exports = { DEFAULT_POOL, parseConfig, parseFallbacks, resolvePools };
+
+
+/***/ }),
+
+/***/ 438:
+/***/ ((module) => {
+
+// Errors in the routing setup itself. These fail the job even with
+// fallback-on-error, because falling back would hide a broken configuration.
+class ConfigError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ConfigError';
+  }
+}
+
+module.exports = { ConfigError };
 
 
 /***/ }),
@@ -55183,17 +55389,10 @@ module.exports = { inferFromLabels, fromRunner, mismatch, describe, isKnown };
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 const platform = __nccwpck_require__(1274);
+const { ConfigError } = __nccwpck_require__(438);
+const checks = __nccwpck_require__(1680);
 
 const CLAIM_PREFIX = 'routact-claim-';
-
-// Errors in the routing setup itself. These fail the job even with
-// fallback-on-error, because falling back would hide a broken configuration.
-class ConfigError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'ConfigError';
-  }
-}
 
 function parseLabels(value) {
   const list = Array.isArray(value) ? value : String(value || '').split(',');
@@ -55252,29 +55451,89 @@ function primaryPlatform(pool, runners) {
   return registered ? platform.fromRunner(registered) : platform.inferFromLabels(pool.primary);
 }
 
-// The fallback can itself be a self-hosted label set, so prefer a registered runner
-function fallbackPlatform(pool, runners) {
-  const registered = runners.find((runner) => hasLabels(runner, pool.fallback));
-  return registered ? platform.fromRunner(registered) : platform.inferFromLabels(pool.fallback);
+// A fallback can itself be a self-hosted label set, so prefer a registered runner
+function stepPlatform(labels, runners) {
+  const registered = runners.find((runner) => hasLabels(runner, labels));
+  return registered ? platform.fromRunner(registered) : platform.inferFromLabels(labels);
 }
 
-// Returns a list of warnings; throws ConfigError when the policy is "error"
+// Checks every fallback step against the primary. Returns a list of warnings;
+// throws ConfigError when the policy is "error".
 function checkPlatform(pool, runners, policy) {
   if (policy === 'off') return [];
   const primary = primaryPlatform(pool, runners);
-  const fallback = fallbackPlatform(pool, runners);
-  const problem = platform.mismatch(primary, fallback);
-  if (problem) {
-    const message = `Pool "${pool.name}": fallback runner does not match the primary platform (${problem}).`;
-    if (policy === 'error') {
-      throw new ConfigError(`${message} Pick a fallback with the same OS and architecture, or set platform-check to "warn" or "off".`);
+  const warnings = [];
+  pool.fallbacks.forEach((step, index) => {
+    const name = pool.fallbacks.length > 1 ? `fallback step ${index + 1} (${step.labels.join(',')})` : 'fallback runner';
+    const fallback = stepPlatform(step.labels, runners);
+    const problem = platform.mismatch(primary, fallback);
+    if (problem) {
+      const message = `Pool "${pool.name}": ${name} does not match the primary platform (${problem}).`;
+      if (policy === 'error') {
+        throw new ConfigError(`${message} Pick a fallback with the same OS and architecture, or set platform-check to "warn" or "off".`);
+      }
+      warnings.push(message);
+    } else if (!platform.isKnown(primary) || !platform.isKnown(fallback)) {
+      warnings.push(`Pool "${pool.name}": could not fully determine the platform (primary ${platform.describe(primary)}, ${name} ${platform.describe(fallback)}), so the platform check is incomplete. Add OS and architecture labels such as Linux,X64 to make it exact.`);
     }
-    return [message];
+  });
+  return warnings;
+}
+
+function isSelfHosted(labels) {
+  return labels.some((label) => label.toLowerCase() === 'self-hosted');
+}
+
+// Walks the fallback steps in order and returns the first whose checks pass.
+// When none pass, the last eligible step is used so a job always has a runner.
+async function chooseFallback(pool, { runners, skipSelfHosted = false, checkContext = {} }) {
+  const idleCount = (labels) => runners.filter((runner) => runner.status === 'online'
+    && runner.busy !== true && hasLabels(runner, labels)).length;
+  const context = {
+    ...checkContext,
+    idleCount,
+    commandEnv: { ...checkContext.commandEnv, ROUTACT_POOL: pool.name },
+  };
+  const skipped = [];
+  const eligible = pool.fallbacks
+    .map((step, index) => ({ step, index }))
+    .filter(({ step, index }) => {
+      if (skipSelfHosted && isSelfHosted(step.labels)) {
+        skipped.push(`step ${index + 1} is self-hosted`);
+        return false;
+      }
+      return true;
+    });
+
+  for (const { step, index } of eligible) {
+    const outcome = await checks.evaluateAll(step, context);
+    if (outcome.passed) return { step, index, skipped };
+    skipped.push(`step ${index + 1} check "${outcome.failed}" failed`);
   }
-  if (!platform.isKnown(primary) || !platform.isKnown(fallback)) {
-    return [`Pool "${pool.name}": could not fully determine the platform (primary ${platform.describe(primary)}, fallback ${platform.describe(fallback)}), so the platform check is incomplete. Add OS and architecture labels such as Linux,X64 to make it exact.`];
-  }
-  return [];
+
+  const last = eligible.length > 0 ? eligible[eligible.length - 1] : { step: pool.fallbacks[pool.fallbacks.length - 1], index: pool.fallbacks.length - 1 };
+  return { ...last, skipped, exhausted: pool.fallbacks.length > 1 || last.step.when.length > 0 };
+}
+
+function describeFallback(pool, choice) {
+  const parts = [];
+  if (pool.fallbacks.length > 1) parts.push(`fallback step ${choice.index + 1}`);
+  if (choice.skipped.length > 0) parts.push(`after ${choice.skipped.join(', ')}`);
+  if (choice.exhausted) parts.push('no step passed its checks, using the last one');
+  return parts.join(', ');
+}
+
+async function fallbackResult(pool, reason, options) {
+  const choice = await chooseFallback(pool, options);
+  const detail = describeFallback(pool, choice);
+  return {
+    labels: choice.step.labels,
+    isPrimary: false,
+    fallbackStep: choice.index + 1,
+    runnerName: '',
+    claim: '',
+    reason: detail ? `${reason}; ${detail}` : reason,
+  };
 }
 
 // Pure decision for one pool given the current runner list
@@ -55387,6 +55646,7 @@ async function routePools({
   random = Math.random,
   log = () => {},
   warn = () => {},
+  checkContext = {},
 }) {
   let runners;
   try {
@@ -55411,30 +55671,34 @@ async function routePools({
   for (const pool of pools) {
     const available = runners.filter((runner) => !claimedIds.has(runner.id));
     const decision = decide(pool, available, { claim, now, claimTtlMs });
+
+    if (!decision.usePrimary) {
+      results[pool.name] = await fallbackResult(pool, decision.reason, { runners: available, checkContext });
+      continue;
+    }
+
     const result = {
-      labels: decision.usePrimary ? pool.primary : pool.fallback,
-      isPrimary: decision.usePrimary,
-      runnerName: '',
+      labels: pool.primary,
+      isPrimary: true,
+      fallbackStep: 0,
+      runnerName: decision.matching.length === 1 ? decision.matching[0].name : '',
       claim: '',
       reason: decision.reason,
     };
 
-    if (decision.usePrimary && claim) {
+    if (claim) {
       const label = claimLabel({ now, runId, attempt, random });
       const won = await claimRunner({ client, candidates: decision.idle, label, now, claimTtlMs, random, log });
-      if (won) {
-        claimedIds.add(won.id);
-        result.labels = [label];
-        result.runnerName = won.name;
-        result.claim = formatClaim(won.id, label);
-        result.reason = `${decision.reason}; claimed runner ${won.name}`;
-      } else {
-        result.labels = pool.fallback;
-        result.isPrimary = false;
-        result.reason = `${decision.reason}, but every idle runner was claimed by another run first`;
+      if (!won) {
+        results[pool.name] = await fallbackResult(pool,
+          `${decision.reason}, but every idle runner was claimed by another run first`, { runners: available, checkContext });
+        continue;
       }
-    } else if (decision.usePrimary && decision.matching.length === 1) {
-      result.runnerName = decision.matching[0].name;
+      claimedIds.add(won.id);
+      result.labels = [label];
+      result.runnerName = won.name;
+      result.claim = formatClaim(won.id, label);
+      result.reason = `${decision.reason}; claimed runner ${won.name}`;
     }
 
     results[pool.name] = result;
@@ -55442,10 +55706,12 @@ async function routePools({
   return results;
 }
 
-function fallbackResults(pools, reason) {
+// Routes without looking at runners: for fork pull requests and API errors.
+// Checks that need the runner list (idle) fail; fork PRs skip self-hosted steps.
+async function fallbackResults(pools, reason, { skipSelfHosted = false, checkContext = {} } = {}) {
   const results = {};
   for (const pool of pools) {
-    results[pool.name] = { labels: pool.fallback, isPrimary: false, runnerName: '', claim: '', reason };
+    results[pool.name] = await fallbackResult(pool, reason, { runners: [], skipSelfHosted, checkContext });
   }
   return results;
 }
@@ -55453,6 +55719,7 @@ function fallbackResults(pools, reason) {
 module.exports = {
   CLAIM_PREFIX,
   ConfigError,
+  chooseFallback,
   parseLabels,
   parseCount,
   hasLabels,

@@ -14,8 +14,8 @@ describe('parseConfig', () => {
     const config = parseConfig(CONFIG);
     expect(config.organization).toBe('solzeroai');
     expect(config.pools).toEqual([
-      { name: 'linux-arm', primary: ['self-hosted', 'Linux', 'ARM64'], fallback: ['ubuntu-24.04-arm'], primariesRequired: 1 },
-      { name: 'mac', primary: ['self-hosted', 'macOS', 'ARM64'], fallback: ['macos-15'], primariesRequired: undefined },
+      { name: 'linux-arm', primary: ['self-hosted', 'Linux', 'ARM64'], fallbacks: [{ labels: ['ubuntu-24.04-arm'], when: [] }], primariesRequired: 1 },
+      { name: 'mac', primary: ['self-hosted', 'macOS', 'ARM64'], fallbacks: [{ labels: ['macos-15'], when: [] }], primariesRequired: undefined },
     ]);
   });
 
@@ -40,7 +40,7 @@ describe('parseConfig', () => {
 describe('resolvePools', () => {
   it('builds a default pool from the single-pool inputs', () => {
     expect(resolvePools({ primaryRunner: 'self-hosted, linux', fallbackRunner: 'linux,x64', primariesRequired: '' })).toEqual([
-      { name: 'default', primary: ['self-hosted', 'linux'], fallback: ['linux', 'x64'], primariesRequired: undefined },
+      { name: 'default', primary: ['self-hosted', 'linux'], fallbacks: [{ labels: ['linux', 'x64'], when: [] }], primariesRequired: undefined },
     ]);
   });
 

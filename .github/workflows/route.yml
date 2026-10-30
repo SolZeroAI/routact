@@ -48,6 +48,9 @@ on:
       ROUTACT_TOKEN:
         description: 'A token to use instead of a GitHub App'
         required: false
+      ROUTACT_CHECK_TOKEN:
+        description: 'Exposed to "command" checks as the ROUTACT_CHECK_TOKEN environment variable'
+        required: false
     outputs:
       runners:
         description: 'JSON object of pool name to label array'
@@ -88,7 +91,10 @@ jobs:
       - name: Route
         id: route
         uses: SolZeroAI/routact@master
+        env:
+          ROUTACT_CHECK_TOKEN: ${{ secrets.ROUTACT_CHECK_TOKEN }}
         with:
+          vars: ${{ toJSON(vars) }}
           github-token: ${{ steps.app-token.outputs.token || secrets.ROUTACT_TOKEN }}
           config: ${{ inputs.config || vars.ROUTACT_CONFIG }}
           pools: ${{ inputs.pools }}

@@ -1,4 +1,6 @@
-const { ConfigError, parseLabels, parseCount } = require('./route');
+const { ConfigError } = require('./errors');
+const { parseLabels, parseCount } = require('./route');
+const { normalizeWhen } = require('./checks');
 
 const DEFAULT_POOL = 'default';
 
@@ -6,7 +8,14 @@ const DEFAULT_POOL = 'default';
 // {
 //   "organization": "my-org",
 //   "pools": {
-//     "linux-arm": { "primary": "self-hosted,Linux,ARM64", "fallback": "ubuntu-24.04-arm", "primaries-required": 1 }
+//     "linux-arm": { "primary": "self-hosted,Linux,ARM64", "fallback": "ubuntu-24.04-arm", "primaries-required": 1 },
+//     "linux-x64": {
+//       "primary": "self-hosted,Linux,X64",
+//       "fallback": [
+//         { "runs-on": "blacksmith-4vcpu-ubuntu-2404", "when": { "var": "ROUTACT_BLACKSMITH_ENABLED" } },
+//         { "runs-on": "ubuntu-24.04" }
+//       ]
+//     }
 //   }
 // }
 // A bare object of pools (without the "pools" key) is accepted too.
@@ -41,12 +50,32 @@ function parsePool(name, value) {
   const pool = {
     name,
     primary: parseLabels(value.primary),
-    fallback: parseLabels(value.fallback),
+    fallbacks: parseFallbacks(value.fallback, `Pool "${name}"`),
     primariesRequired: parseCount(value['primaries-required'], `Pool "${name}" primaries-required`),
   };
   if (pool.primary.length === 0) throw new ConfigError(`Pool "${name}" has no primary labels`);
-  if (pool.fallback.length === 0) throw new ConfigError(`Pool "${name}" has no fallback labels`);
   return pool;
+}
+
+// "fallback" is either labels (a string or list of strings) for one step, or
+// an ordered list of steps: {"runs-on": labels, "when": check or [checks]}
+function parseFallbacks(value, where) {
+  const isChain = Array.isArray(value) && value.some((entry) => entry && typeof entry === 'object');
+  if (!isChain) {
+    const labels = parseLabels(value);
+    if (labels.length === 0) throw new ConfigError(`${where} has no fallback labels`);
+    return [{ labels, when: [] }];
+  }
+  if (value.length === 0) throw new ConfigError(`${where} has no fallback labels`);
+  return value.map((entry, index) => {
+    const stepWhere = `${where} fallback step ${index + 1}`;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new ConfigError(`${stepWhere} must be an object with "runs-on"`);
+    }
+    const labels = parseLabels(entry['runs-on']);
+    if (labels.length === 0) throw new ConfigError(`${stepWhere} has no "runs-on" labels`);
+    return { labels, when: normalizeWhen(entry.when, stepWhere) };
+  });
 }
 
 function omit(object, keys) {
@@ -63,7 +92,7 @@ function resolvePools({ primaryRunner, fallbackRunner, primariesRequired, config
     return [{
       name: DEFAULT_POOL,
       primary: parseLabels(primaryRunner),
-      fallback: parseLabels(fallbackRunner),
+      fallbacks: parseFallbacks(fallbackRunner, 'fallback-runner'),
       primariesRequired: parseCount(primariesRequired),
     }];
   }
@@ -82,4 +111,4 @@ function resolvePools({ primaryRunner, fallbackRunner, primariesRequired, config
   });
 }
 
-module.exports = { DEFAULT_POOL, parseConfig, resolvePools };
+module.exports = { DEFAULT_POOL, parseConfig, parseFallbacks, resolvePools };

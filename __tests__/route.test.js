@@ -11,10 +11,10 @@ const {
 
 const NOW = 1_800_000_000_000;
 const TTL = 10 * 60 * 1000;
-const linux = (overrides = {}) => ({
+const linux = ({ fallback = ['ubuntu-24.04'], ...overrides } = {}) => ({
   name: 'default',
   primary: ['self-hosted', 'Linux', 'X64'],
-  fallback: ['ubuntu-24.04'],
+  fallbacks: [{ labels: fallback, when: [] }],
   primariesRequired: undefined,
   ...overrides,
 });

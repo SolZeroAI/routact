@@ -1,15 +1,8 @@
 const platform = require('./platform');
+const { ConfigError } = require('./errors');
+const checks = require('./checks');
 
 const CLAIM_PREFIX = 'routact-claim-';
-
-// Errors in the routing setup itself. These fail the job even with
-// fallback-on-error, because falling back would hide a broken configuration.
-class ConfigError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'ConfigError';
-  }
-}
 
 function parseLabels(value) {
   const list = Array.isArray(value) ? value : String(value || '').split(',');
@@ -68,29 +61,89 @@ function primaryPlatform(pool, runners) {
   return registered ? platform.fromRunner(registered) : platform.inferFromLabels(pool.primary);
 }
 
-// The fallback can itself be a self-hosted label set, so prefer a registered runner
-function fallbackPlatform(pool, runners) {
-  const registered = runners.find((runner) => hasLabels(runner, pool.fallback));
-  return registered ? platform.fromRunner(registered) : platform.inferFromLabels(pool.fallback);
+// A fallback can itself be a self-hosted label set, so prefer a registered runner
+function stepPlatform(labels, runners) {
+  const registered = runners.find((runner) => hasLabels(runner, labels));
+  return registered ? platform.fromRunner(registered) : platform.inferFromLabels(labels);
 }
 
-// Returns a list of warnings; throws ConfigError when the policy is "error"
+// Checks every fallback step against the primary. Returns a list of warnings;
+// throws ConfigError when the policy is "error".
 function checkPlatform(pool, runners, policy) {
   if (policy === 'off') return [];
   const primary = primaryPlatform(pool, runners);
-  const fallback = fallbackPlatform(pool, runners);
-  const problem = platform.mismatch(primary, fallback);
-  if (problem) {
-    const message = `Pool "${pool.name}": fallback runner does not match the primary platform (${problem}).`;
-    if (policy === 'error') {
-      throw new ConfigError(`${message} Pick a fallback with the same OS and architecture, or set platform-check to "warn" or "off".`);
+  const warnings = [];
+  pool.fallbacks.forEach((step, index) => {
+    const name = pool.fallbacks.length > 1 ? `fallback step ${index + 1} (${step.labels.join(',')})` : 'fallback runner';
+    const fallback = stepPlatform(step.labels, runners);
+    const problem = platform.mismatch(primary, fallback);
+    if (problem) {
+      const message = `Pool "${pool.name}": ${name} does not match the primary platform (${problem}).`;
+      if (policy === 'error') {
+        throw new ConfigError(`${message} Pick a fallback with the same OS and architecture, or set platform-check to "warn" or "off".`);
+      }
+      warnings.push(message);
+    } else if (!platform.isKnown(primary) || !platform.isKnown(fallback)) {
+      warnings.push(`Pool "${pool.name}": could not fully determine the platform (primary ${platform.describe(primary)}, ${name} ${platform.describe(fallback)}), so the platform check is incomplete. Add OS and architecture labels such as Linux,X64 to make it exact.`);
     }
-    return [message];
+  });
+  return warnings;
+}
+
+function isSelfHosted(labels) {
+  return labels.some((label) => label.toLowerCase() === 'self-hosted');
+}
+
+// Walks the fallback steps in order and returns the first whose checks pass.
+// When none pass, the last eligible step is used so a job always has a runner.
+async function chooseFallback(pool, { runners, skipSelfHosted = false, checkContext = {} }) {
+  const idleCount = (labels) => runners.filter((runner) => runner.status === 'online'
+    && runner.busy !== true && hasLabels(runner, labels)).length;
+  const context = {
+    ...checkContext,
+    idleCount,
+    commandEnv: { ...checkContext.commandEnv, ROUTACT_POOL: pool.name },
+  };
+  const skipped = [];
+  const eligible = pool.fallbacks
+    .map((step, index) => ({ step, index }))
+    .filter(({ step, index }) => {
+      if (skipSelfHosted && isSelfHosted(step.labels)) {
+        skipped.push(`step ${index + 1} is self-hosted`);
+        return false;
+      }
+      return true;
+    });
+
+  for (const { step, index } of eligible) {
+    const outcome = await checks.evaluateAll(step, context);
+    if (outcome.passed) return { step, index, skipped };
+    skipped.push(`step ${index + 1} check "${outcome.failed}" failed`);
   }
-  if (!platform.isKnown(primary) || !platform.isKnown(fallback)) {
-    return [`Pool "${pool.name}": could not fully determine the platform (primary ${platform.describe(primary)}, fallback ${platform.describe(fallback)}), so the platform check is incomplete. Add OS and architecture labels such as Linux,X64 to make it exact.`];
-  }
-  return [];
+
+  const last = eligible.length > 0 ? eligible[eligible.length - 1] : { step: pool.fallbacks[pool.fallbacks.length - 1], index: pool.fallbacks.length - 1 };
+  return { ...last, skipped, exhausted: pool.fallbacks.length > 1 || last.step.when.length > 0 };
+}
+
+function describeFallback(pool, choice) {
+  const parts = [];
+  if (pool.fallbacks.length > 1) parts.push(`fallback step ${choice.index + 1}`);
+  if (choice.skipped.length > 0) parts.push(`after ${choice.skipped.join(', ')}`);
+  if (choice.exhausted) parts.push('no step passed its checks, using the last one');
+  return parts.join(', ');
+}
+
+async function fallbackResult(pool, reason, options) {
+  const choice = await chooseFallback(pool, options);
+  const detail = describeFallback(pool, choice);
+  return {
+    labels: choice.step.labels,
+    isPrimary: false,
+    fallbackStep: choice.index + 1,
+    runnerName: '',
+    claim: '',
+    reason: detail ? `${reason}; ${detail}` : reason,
+  };
 }
 
 // Pure decision for one pool given the current runner list
@@ -203,6 +256,7 @@ async function routePools({
   random = Math.random,
   log = () => {},
   warn = () => {},
+  checkContext = {},
 }) {
   let runners;
   try {
@@ -227,30 +281,34 @@ async function routePools({
   for (const pool of pools) {
     const available = runners.filter((runner) => !claimedIds.has(runner.id));
     const decision = decide(pool, available, { claim, now, claimTtlMs });
+
+    if (!decision.usePrimary) {
+      results[pool.name] = await fallbackResult(pool, decision.reason, { runners: available, checkContext });
+      continue;
+    }
+
     const result = {
-      labels: decision.usePrimary ? pool.primary : pool.fallback,
-      isPrimary: decision.usePrimary,
-      runnerName: '',
+      labels: pool.primary,
+      isPrimary: true,
+      fallbackStep: 0,
+      runnerName: decision.matching.length === 1 ? decision.matching[0].name : '',
       claim: '',
       reason: decision.reason,
     };
 
-    if (decision.usePrimary && claim) {
+    if (claim) {
       const label = claimLabel({ now, runId, attempt, random });
       const won = await claimRunner({ client, candidates: decision.idle, label, now, claimTtlMs, random, log });
-      if (won) {
-        claimedIds.add(won.id);
-        result.labels = [label];
-        result.runnerName = won.name;
-        result.claim = formatClaim(won.id, label);
-        result.reason = `${decision.reason}; claimed runner ${won.name}`;
-      } else {
-        result.labels = pool.fallback;
-        result.isPrimary = false;
-        result.reason = `${decision.reason}, but every idle runner was claimed by another run first`;
+      if (!won) {
+        results[pool.name] = await fallbackResult(pool,
+          `${decision.reason}, but every idle runner was claimed by another run first`, { runners: available, checkContext });
+        continue;
       }
-    } else if (decision.usePrimary && decision.matching.length === 1) {
-      result.runnerName = decision.matching[0].name;
+      claimedIds.add(won.id);
+      result.labels = [label];
+      result.runnerName = won.name;
+      result.claim = formatClaim(won.id, label);
+      result.reason = `${decision.reason}; claimed runner ${won.name}`;
     }
 
     results[pool.name] = result;
@@ -258,10 +316,12 @@ async function routePools({
   return results;
 }
 
-function fallbackResults(pools, reason) {
+// Routes without looking at runners: for fork pull requests and API errors.
+// Checks that need the runner list (idle) fail; fork PRs skip self-hosted steps.
+async function fallbackResults(pools, reason, { skipSelfHosted = false, checkContext = {} } = {}) {
   const results = {};
   for (const pool of pools) {
-    results[pool.name] = { labels: pool.fallback, isPrimary: false, runnerName: '', claim: '', reason };
+    results[pool.name] = await fallbackResult(pool, reason, { runners: [], skipSelfHosted, checkContext });
   }
   return results;
 }
@@ -269,6 +329,7 @@ function fallbackResults(pools, reason) {
 module.exports = {
   CLAIM_PREFIX,
   ConfigError,
+  chooseFallback,
   parseLabels,
   parseCount,
   hasLabels,
