@@ -53,6 +53,9 @@ on:
       ROUTACT_CHECK_TOKEN:
         description: 'Exposed to flag commands as the ROUTACT_CHECK_TOKEN environment variable'
         required: false
+      BLACKSMITH_API_TOKEN:
+        description: 'Blacksmith organization token, for "blacksmith" flags'
+        required: false
     outputs:
       problems:
         value: ${{ jobs.maintain.outputs.problems }}
@@ -84,6 +87,7 @@ jobs:
         uses: SolZeroAI/routact@master
         env:
           ROUTACT_CHECK_TOKEN: ${{ secrets.ROUTACT_CHECK_TOKEN }}
+          BLACKSMITH_API_TOKEN: ${{ secrets.BLACKSMITH_API_TOKEN }}
         with:
           mode: maintain
           github-token: ${{ steps.app-token.outputs.token || secrets.ROUTACT_TOKEN }}

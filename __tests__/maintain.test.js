@@ -3,7 +3,7 @@ const path = require('path');
 const { runner, FakeClient } = require('./helpers');
 const { parseImages, newerLabel, findImage } = require('../src/images');
 const { parseConfig } = require('../src/config');
-const { parseTasks, parseFlags, validate, reviewImages, upgradeConfig, maintain } = require('../src/maintain');
+const { parseTasks, parseFlags, validate, reviewImages, upgradeConfig, maintain, blacksmithUsageScript, withinBlacksmithLimits } = require('../src/maintain');
 const { ConfigError } = require('../src/errors');
 
 // Snapshot of the runner-images README table, October 2026
@@ -169,5 +169,54 @@ describe('maintain', () => {
     const report = await maintain(base({ tasks: ['images'], loadImages: async () => { throw new Error('offline'); } }));
     expect(report.errors).toEqual([]);
     expect(report.warnings).toEqual(['Could not check GitHub-hosted images: offline']);
+  });
+});
+
+describe('blacksmith flags', () => {
+  // Trimmed from real `blacksmith usage` output
+  const USAGE = { summary: { jobs: 5109, billable_minutes: 59146, billing_minutes: 104060, cost_usd: 208.12 } };
+
+  it('parses the built-in check', () => {
+    expect(parseFlags('{"ROUTACT_BLACKSMITH_ENABLED":{"blacksmith":{"budget-usd":250}}}')).toEqual([{
+      name: 'ROUTACT_BLACKSMITH_ENABLED',
+      blacksmith: { limits: [{ key: 'budget-usd', field: 'cost_usd', unit: '$', limit: 250 }], organization: undefined },
+    }]);
+    expect(() => parseFlags('{"A":{"blacksmith":{}}}')).toThrow(/needs "budget-usd" or "max-billing-minutes"/);
+    expect(() => parseFlags('{"A":{"blacksmith":{"budget-usd":"x"}}}')).toThrow(/needs a number/);
+    expect(() => parseFlags('{"A":{"blacksmith":{"budget-usd":1,"organization":"a b"}}}')).toThrow(/slug/);
+  });
+
+  it('compares usage with every limit', () => {
+    const log = jest.fn();
+    const limit = (key, field, value) => ({ key, field, unit: key === 'budget-usd' ? '$' : ' billing minutes', limit: value });
+    expect(withinBlacksmithLimits(USAGE, [limit('budget-usd', 'cost_usd', 250)], log)).toBe(true);
+    expect(log).toHaveBeenCalledWith('Blacksmith this month: $208.12 of $250 (budget-usd)');
+    expect(withinBlacksmithLimits(USAGE, [limit('budget-usd', 'cost_usd', 200)], log)).toBe(false);
+    expect(withinBlacksmithLimits(USAGE, [
+      limit('budget-usd', 'cost_usd', 250),
+      limit('max-billing-minutes', 'billing_minutes', 100000),
+    ], log)).toBe(false);
+    expect(() => withinBlacksmithLimits({}, [limit('budget-usd', 'cost_usd', 1)], log)).toThrow(/no summary.cost_usd/);
+  });
+
+  it('builds a script for the current month that signs in with the org token', () => {
+    const script = blacksmithUsageScript(undefined);
+    expect(script).toContain('--organization "$ROUTACT_ORGANIZATION"');
+    expect(script).toContain('BLACKSMITH_API_TOKEN');
+    expect(script).toContain('sha256sum');
+    expect(script).toContain('--start-time "$(date -u +%Y-%m-01T00:00:00Z)"');
+    expect(blacksmithUsageScript('solzero')).toContain('--organization "solzero"');
+  });
+
+  it('sets the variable from usage and keeps it on failure', async () => {
+    const setVariable = jest.fn().mockResolvedValue();
+    const flags = parseFlags('{"ON":{"blacksmith":{"budget-usd":250}},"OFF":{"blacksmith":{"budget-usd":100}},"BROKEN":{"blacksmith":{"budget-usd":1}}}');
+    const exec = jest.fn()
+      .mockResolvedValueOnce({ ok: true, stdout: JSON.stringify(USAGE) })
+      .mockResolvedValueOnce({ ok: true, stdout: JSON.stringify(USAGE) })
+      .mockResolvedValueOnce({ ok: false, stdout: '' });
+    const report = await maintain({ tasks: ['flags'], flags, exec, setVariable, vars: { OFF: 'true', BROKEN: 'true' } });
+    expect(setVariable.mock.calls).toEqual([['ON', 'true'], ['OFF', 'false']]);
+    expect(report.errors).toEqual(['Flag BROKEN not updated: Could not read Blacksmith usage for BROKEN']);
   });
 });

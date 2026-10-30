@@ -55065,18 +55065,16 @@ function describe(check) {
   return `any of ${check.any.map(describe).join(', ')}`;
 }
 
-// Runs a shell command; resolves true on exit code 0. Never rejects: a
-// command that cannot start or times out counts as a failed check.
-function runCommand(command, { env = {}, timeoutSeconds = DEFAULT_COMMAND_TIMEOUT_SECONDS, log = () => {} } = {}) {
+function execCommand(command, { env = {}, timeoutSeconds = DEFAULT_COMMAND_TIMEOUT_SECONDS, log = () => {}, quiet = false } = {}) {
   return new Promise((resolve) => {
     const child = spawn('bash', ['-c', command], {
       env: { ...process.env, ...env },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    let stdout = '';
     let output = '';
-    const collect = (chunk) => { output += chunk; };
-    child.stdout.on('data', collect);
-    child.stderr.on('data', collect);
+    child.stdout.on('data', (chunk) => { stdout += chunk; output += chunk; });
+    child.stderr.on('data', (chunk) => { output += chunk; });
     const timer = setTimeout(() => {
       log(`Check command timed out after ${timeoutSeconds}s`);
       child.kill('SIGKILL');
@@ -55084,14 +55082,20 @@ function runCommand(command, { env = {}, timeoutSeconds = DEFAULT_COMMAND_TIMEOU
     child.on('error', (error) => {
       clearTimeout(timer);
       log(`Check command could not start: ${error.message}`);
-      resolve(false);
+      resolve({ ok: false, stdout, output });
     });
     child.on('close', (code) => {
       clearTimeout(timer);
-      if (output.trim()) log(output.trim());
-      resolve(code === 0);
+      if (output.trim() && (!quiet || code !== 0)) log(output.trim());
+      resolve({ ok: code === 0, stdout, output });
     });
   });
+}
+
+// Runs a shell command; resolves true on exit code 0. Never rejects: a
+// command that cannot start or times out counts as a failed check.
+async function runCommand(command, options) {
+  return (await execCommand(command, options)).ok;
 }
 
 // Passes while the paid part of this month's Actions usage is at most maxSpend
@@ -55156,7 +55160,7 @@ function parseVars(text) {
   }
 }
 
-module.exports = { normalizeWhen, evaluate, evaluateAll, describe, runCommand, parseVars };
+module.exports = { normalizeWhen, evaluate, evaluateAll, describe, runCommand, execCommand, parseVars };
 
 
 /***/ }),
@@ -55619,9 +55623,12 @@ function parseTasks(text) {
   return tasks;
 }
 
-// Flags: {"VARIABLE": "command"} or {"VARIABLE": {"command": "..."}}. Each
-// command runs on schedule and sets the org variable to "true" when it exits 0,
-// "false" otherwise, for "var" checks to read.
+// Flags map an org variable to a check that runs on schedule. The variable is
+// set to "true" when the check passes, "false" otherwise, for "var" checks to
+// read. A flag is a shell command (exit 0 passes), or a built-in check:
+//   {"VARIABLE": "command"}
+//   {"VARIABLE": {"command": "..."}}
+//   {"VARIABLE": {"blacksmith": {"budget-usd": 250}}}
 function parseFlags(text) {
   if (!text || !String(text).trim()) return [];
   let parsed;
@@ -55634,11 +55641,85 @@ function parseFlags(text) {
     throw new ConfigError('flags must be a JSON object of variable name to command');
   }
   return Object.entries(parsed).map(([name, value]) => {
-    const command = typeof value === 'string' ? value : value && value.command;
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new ConfigError(`flags: "${name}" is not a valid variable name`);
+    if (value && typeof value === 'object' && value.blacksmith !== undefined) {
+      return { name, blacksmith: parseBlacksmith(value.blacksmith, `flags: "${name}"`) };
+    }
+    const command = typeof value === 'string' ? value : value && value.command;
     if (typeof command !== 'string' || !command.trim()) throw new ConfigError(`flags: "${name}" needs a command`);
     return { name, command };
   });
+}
+
+const BLACKSMITH_LIMITS = [
+  { key: 'budget-usd', field: 'cost_usd', unit: '$' },
+  { key: 'max-billing-minutes', field: 'billing_minutes', unit: ' billing minutes' },
+];
+
+// Built-in Blacksmith check: passes while this calendar month's (UTC) usage is
+// below every limit given. Options:
+//   budget-usd           limit on summary.cost_usd
+//   max-billing-minutes  limit on summary.billing_minutes
+//   organization         Blacksmith organization slug (default: the GitHub org)
+function parseBlacksmith(spec, where) {
+  if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
+    throw new ConfigError(`${where}: "blacksmith" needs an object such as {"budget-usd": 250}`);
+  }
+  const limits = [];
+  for (const { key, field, unit } of BLACKSMITH_LIMITS) {
+    if (spec[key] === undefined) continue;
+    if (typeof spec[key] !== 'number' || !(spec[key] >= 0)) throw new ConfigError(`${where}: "${key}" needs a number of at least 0`);
+    limits.push({ key, field, unit, limit: spec[key] });
+  }
+  if (limits.length === 0) throw new ConfigError(`${where}: "blacksmith" needs "budget-usd" or "max-billing-minutes"`);
+  if (spec.organization !== undefined && (typeof spec.organization !== 'string' || !/^[\w.-]+$/.test(spec.organization))) {
+    throw new ConfigError(`${where}: "organization" must be a Blacksmith organization slug`);
+  }
+  return { limits, organization: spec.organization };
+}
+
+// Prints this month's usage as JSON. Downloads the CLI binary with its checksum
+// instead of running the installer, which also installs rsync, and signs in
+// with the BLACKSMITH_API_TOKEN environment variable (an organization token).
+function blacksmithUsageScript(organization) {
+  const org = organization || '$ROUTACT_ORGANIZATION';
+  return `set -euo pipefail
+if [ -z "\${BLACKSMITH_API_TOKEN:-}" ]; then echo "BLACKSMITH_API_TOKEN is not set" >&2; exit 2; fi
+dir="$(mktemp -d)"; cd "$dir"; export HOME="$dir"
+case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; arm64|aarch64) arch=arm64 ;; *) echo "Unsupported architecture" >&2; exit 2 ;; esac
+url="https://clireleases.blacksmith.sh/cli/latest/$(uname -s | tr '[:upper:]' '[:lower:]')/$arch/blacksmith"
+curl -fsSL "$url" -o blacksmith
+curl -fsSL "$url.sha256" -o blacksmith.sha256
+[ "$(awk '{print $1}' blacksmith.sha256)" = "$(sha256sum blacksmith | awk '{print $1}')" ] || { echo "Blacksmith CLI checksum mismatch" >&2; exit 2; }
+chmod +x blacksmith
+printf '%s' "$BLACKSMITH_API_TOKEN" | ./blacksmith auth login --api-token - --non-interactive --organization "${org}" >&2
+./blacksmith usage --start-time "$(date -u +%Y-%m-01T00:00:00Z)" --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)"`;
+}
+
+// Returns true while usage is below every limit
+function withinBlacksmithLimits(usage, limits, log) {
+  const summary = (usage && usage.summary) || {};
+  let within = true;
+  for (const { key, field, unit, limit } of limits) {
+    const value = Number(summary[field]);
+    if (!Number.isFinite(value)) throw new Error(`Blacksmith usage has no summary.${field}`);
+    const shown = unit === '$' ? `$${value.toFixed(2)} of $${limit}` : `${value} of ${limit}${unit}`;
+    log(`Blacksmith this month: ${shown} (${key})`);
+    if (value >= limit) within = false;
+  }
+  return within;
+}
+
+async function blacksmithFlag(flag, { exec, commandEnv, timeoutSeconds, log }) {
+  const result = await exec(blacksmithUsageScript(flag.blacksmith.organization), { env: commandEnv, timeoutSeconds, log, quiet: true });
+  if (!result.ok) throw new Error(`Could not read Blacksmith usage for ${flag.name}`);
+  let usage;
+  try {
+    usage = JSON.parse(result.stdout);
+  } catch {
+    throw new Error(`Blacksmith usage for ${flag.name} was not JSON`);
+  }
+  return withinBlacksmithLimits(usage, flag.blacksmith.limits, log);
 }
 
 function varNames(check) {
@@ -55738,16 +55819,25 @@ function upgradeConfig(raw, upgrades) {
   return copy;
 }
 
-async function updateFlags({ flags, vars, run, setVariable, commandEnv, timeoutSeconds, log }) {
+// Returns {results, errors}. A flag whose check or update fails is left as it
+// was, so a network blip never flips a variable.
+async function updateFlags({ flags, vars, run, exec, setVariable, commandEnv, timeoutSeconds, log }) {
   const results = [];
+  const errors = [];
   for (const flag of flags) {
-    const passed = await run(flag.command, { env: commandEnv, timeoutSeconds, log });
-    const value = passed ? 'true' : 'false';
-    const changed = vars[flag.name] !== value;
-    if (changed) await setVariable(flag.name, value);
-    results.push({ name: flag.name, value, changed });
+    try {
+      const passed = flag.blacksmith
+        ? await blacksmithFlag(flag, { exec, commandEnv, timeoutSeconds, log })
+        : await run(flag.command, { env: commandEnv, timeoutSeconds, log });
+      const value = passed ? 'true' : 'false';
+      const changed = vars[flag.name] !== value;
+      if (changed) await setVariable(flag.name, value);
+      results.push({ name: flag.name, value, changed });
+    } catch (error) {
+      errors.push(`Flag ${flag.name} not updated: ${error.message}`);
+    }
   }
-  return results;
+  return { results, errors };
 }
 
 async function maintain({
@@ -55758,6 +55848,7 @@ async function maintain({
   flags = [],
   loadImages = images.fetchImages,
   run = checks.runCommand,
+  exec = checks.execCommand,
   setVariable,
   applyUpgrades = false,
   commandEnv = {},
@@ -55767,13 +55858,11 @@ async function maintain({
   const report = { errors: [], warnings: [], upgrades: {}, suggestedConfig: undefined, flags: [], applied: false };
 
   if (tasks.includes('flags') && flags.length > 0) {
-    try {
-      report.flags = await updateFlags({ flags, vars, run, setVariable, commandEnv, timeoutSeconds, log });
-      // Later checks read the updated values
-      for (const flag of report.flags) vars = { ...vars, [flag.name]: flag.value };
-    } catch (error) {
-      report.errors.push(`Updating flags failed: ${error.message}`);
-    }
+    const { results, errors } = await updateFlags({ flags, vars, run, exec, setVariable, commandEnv, timeoutSeconds, log });
+    report.flags = results;
+    report.errors.push(...errors);
+    // Later checks read the updated values
+    for (const flag of results) vars = { ...vars, [flag.name]: flag.value };
   }
 
   const wantsConfig = tasks.includes('validate') || tasks.includes('images');
@@ -55825,7 +55914,7 @@ async function maintain({
   return report;
 }
 
-module.exports = { TASKS, parseTasks, parseFlags, validate, reviewImages, upgradeConfig, maintain };
+module.exports = { TASKS, parseTasks, parseFlags, blacksmithUsageScript, withinBlacksmithLimits, validate, reviewImages, upgradeConfig, maintain };
 
 
 /***/ }),

@@ -70,18 +70,16 @@ function describe(check) {
   return `any of ${check.any.map(describe).join(', ')}`;
 }
 
-// Runs a shell command; resolves true on exit code 0. Never rejects: a
-// command that cannot start or times out counts as a failed check.
-function runCommand(command, { env = {}, timeoutSeconds = DEFAULT_COMMAND_TIMEOUT_SECONDS, log = () => {} } = {}) {
+function execCommand(command, { env = {}, timeoutSeconds = DEFAULT_COMMAND_TIMEOUT_SECONDS, log = () => {}, quiet = false } = {}) {
   return new Promise((resolve) => {
     const child = spawn('bash', ['-c', command], {
       env: { ...process.env, ...env },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    let stdout = '';
     let output = '';
-    const collect = (chunk) => { output += chunk; };
-    child.stdout.on('data', collect);
-    child.stderr.on('data', collect);
+    child.stdout.on('data', (chunk) => { stdout += chunk; output += chunk; });
+    child.stderr.on('data', (chunk) => { output += chunk; });
     const timer = setTimeout(() => {
       log(`Check command timed out after ${timeoutSeconds}s`);
       child.kill('SIGKILL');
@@ -89,14 +87,20 @@ function runCommand(command, { env = {}, timeoutSeconds = DEFAULT_COMMAND_TIMEOU
     child.on('error', (error) => {
       clearTimeout(timer);
       log(`Check command could not start: ${error.message}`);
-      resolve(false);
+      resolve({ ok: false, stdout, output });
     });
     child.on('close', (code) => {
       clearTimeout(timer);
-      if (output.trim()) log(output.trim());
-      resolve(code === 0);
+      if (output.trim() && (!quiet || code !== 0)) log(output.trim());
+      resolve({ ok: code === 0, stdout, output });
     });
   });
+}
+
+// Runs a shell command; resolves true on exit code 0. Never rejects: a
+// command that cannot start or times out counts as a failed check.
+async function runCommand(command, options) {
+  return (await execCommand(command, options)).ok;
 }
 
 // Passes while the paid part of this month's Actions usage is at most maxSpend
@@ -161,4 +165,4 @@ function parseVars(text) {
   }
 }
 
-module.exports = { normalizeWhen, evaluate, evaluateAll, describe, runCommand, parseVars };
+module.exports = { normalizeWhen, evaluate, evaluateAll, describe, runCommand, execCommand, parseVars };

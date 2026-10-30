@@ -260,13 +260,20 @@ A scheduled maintenance job keeps the org settings honest. It runs the action wi
 | `images` | Checks every GitHub-hosted label in the fallbacks against the current [runner-images](https://github.com/actions/runner-images) list. It fails on retired or deprecated labels, warns about beta and preview images, and suggests the newest generally available label of the same kind (for example `ubuntu-24.04` to `ubuntu-26.04`, or `macos-15-intel` to `macos-26-intel`). The suggested config is in the job summary and the `suggested-config` output. It changes `ROUTACT_CONFIG` only with `apply-upgrades: true`, because a new image can break builds. |
 | `flags` | Runs each command in the org variable `ROUTACT_FLAGS` and sets the named org variable to `true` when it exits 0, else `false`. This is how slow checks such as Blacksmith minutes stay out of the route job. |
 
-`ROUTACT_FLAGS` maps variable names to shell commands:
+`ROUTACT_FLAGS` maps variable names to checks. A check is a shell command (exit 0 sets `true`) or the built-in Blacksmith budget check:
 
 ```json
-{ "ROUTACT_BLACKSMITH_ENABLED": "curl -fsS -H \"Authorization: Bearer $ROUTACT_CHECK_TOKEN\" https://ci-budget.example.com/blacksmith/ok" }
+{
+  "ROUTACT_BLACKSMITH_ENABLED": { "blacksmith": { "budget-usd": 250 } },
+  "ROUTACT_BUDGET_OK": "curl -fsS -H \"Authorization: Bearer $ROUTACT_CHECK_TOKEN\" https://ci-budget.example.com/ok"
+}
 ```
 
-Commands get `ROUTACT_ORGANIZATION` and, through the reusable workflow, the `ROUTACT_CHECK_TOKEN` secret, and have 120 seconds each.
+The **Blacksmith check** sets the variable to `true` while this calendar month's (UTC) Blacksmith usage is below every limit you give: `budget-usd` (compared with `cost_usd`) and `max-billing-minutes` (compared with `billing_minutes`). It downloads the Blacksmith CLI, verifies its checksum, signs in with the org secret `BLACKSMITH_API_TOKEN` (create an organization token in Blacksmith), and reads `blacksmith usage`. Add `"organization": "<slug>"` if your Blacksmith organization slug differs from the GitHub organization name.
+
+If a check cannot run (no token, network error), the variable keeps its last value and the job reports a problem, so a blip never flips routing.
+
+Shell commands get `ROUTACT_ORGANIZATION` and, through the reusable workflow, the `ROUTACT_CHECK_TOKEN` secret. Each check has 120 seconds.
 
 To schedule it, call the reusable workflow from one repository (SolZeroAI's runs from this repository, see `.github/workflows/solzero-maintain.yml`):
 
